@@ -6,13 +6,13 @@ import (
 	"sync"
 )
 
-// pendingHeap 是某个业务键上因序号缺口而暂缓的最小序号堆。
-type pendingHeap []*workItem
+// pendingHeap 是某个业务键上因序号缺口而暂缓的事件最小序号堆。
+type pendingHeap []queuedItem
 
 func (h pendingHeap) Len() int           { return len(h) }
-func (h pendingHeap) Less(i, j int) bool { return h[i].ev.ev.Seq < h[j].ev.ev.Seq }
+func (h pendingHeap) Less(i, j int) bool { return h[i].ev.Seq < h[j].ev.Seq }
 func (h pendingHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *pendingHeap) Push(x any)        { *h = append(*h, x.(*workItem)) }
+func (h *pendingHeap) Push(x any)        { *h = append(*h, x.(queuedItem)) }
 func (h *pendingHeap) Pop() any {
 	old := *h
 	n := len(old)
@@ -21,28 +21,18 @@ func (h *pendingHeap) Pop() any {
 	return it
 }
 
-// workItem 是协调协程 mailbox 中的一个工作单元，done 在该事件得到最终结论
-// （应用/判重/冲突/死信）或因序号缺口暂缓而释放投递 worker 时关闭。
-type workItem struct {
-	ev      queuedItem
-	done    chan struct{}
-	doneOne sync.Once
-}
-
-// finish 幂等地关闭 done，保证同一事件在“缺口暂缓”与后续“真正处理”两条
-// 路径上不会重复关闭。
-func (w *workItem) finish() { w.doneOne.Do(func() { close(w.done) }) }
-
-// defaultMailboxCap 是单个业务键 mailbox 的默认缓冲大小。
 const defaultMailboxCap = 256
 
-// keyCoordinator 是单个业务键的串行处理 actor：同键事件由唯一协程按 Seq
-// 顺序生效，不同键的协调协程并行。worker 投递后阻塞在 workItem.done 上，
-// 因此在途处理总数始终受 worker 数约束，背压由有界队列真实反映。
+// keyCoordinator 是单个业务键的串行处理 actor。同键事件全部进入 mailbox，
+// 由唯一协程按 Seq 顺序生效：衔接的处理，缺口的入堆等待前驱，前驱应用后
+// 级联处理堆顶连续事件。
+//
+// 投递是异步的：worker 把事件放入 mailbox（经全局在途信号量限并发）后立即
+// 返回，不阻塞等待处理完成，因此“序号缺口”不会占用任何 worker 线程。
 type keyCoordinator struct {
 	eng     *Engine
 	key     string
-	mailbox chan *workItem
+	mailbox chan queuedItem
 
 	mu       sync.Mutex
 	waitHeap pendingHeap
@@ -58,26 +48,29 @@ func newKeyCoordinator(eng *Engine, key string) *keyCoordinator {
 	c := &keyCoordinator{
 		eng:     eng,
 		key:     key,
-		mailbox: make(chan *workItem, capN),
+		mailbox: make(chan queuedItem, capN),
 	}
 	c.wg.Add(1)
 	go c.run()
 	return c
 }
 
-// deliver 投递事件并同步等待最终结论（或停机放弃）。返回 false 表示停机
-// 期间未能/未完成，调用方不 Ack 以保留事件待重放。
+// deliver 异步投递：先占用一个全局在途槽位（限制系统中被接收待处理的事件
+// 总量，构成背压），再把事件放入该键 mailbox。mailbox 满或停机时释放槽位
+// 并返回 false，调用方按队列背压/停机处理（事件保留在持久日志中）。
 func (c *keyCoordinator) deliver(item queuedItem) bool {
-	wi := &workItem{ev: item, done: make(chan struct{})}
-	select {
-	case c.mailbox <- wi:
-	case <-c.eng.finishCh:
+	if !c.eng.inflightSem.acquire(c.eng.finishCh) {
 		return false
 	}
 	select {
-	case <-wi.done:
+	case c.mailbox <- item:
 		return true
 	case <-c.eng.finishCh:
+		c.eng.inflightSem.release()
+		return false
+	default:
+		// mailbox 满：该键处理能力不足，按容量背压拒绝，事件已在持久日志。
+		c.eng.inflightSem.release()
 		return false
 	}
 }
@@ -88,10 +81,12 @@ func (c *keyCoordinator) run() {
 		select {
 		case <-c.eng.finishCh:
 			return
-		case wi := <-c.mailbox:
+		case item := <-c.mailbox:
 			c.setBusy(true)
-			c.processOne(wi)
+			c.processOne(item)
 			c.setBusy(false)
+			// 事件走完最终结论（或确认暂缓）后释放一个在途槽位。
+			c.eng.inflightSem.release()
 		}
 	}
 }
@@ -102,24 +97,29 @@ func (c *keyCoordinator) setBusy(b bool) {
 	c.mu.Unlock()
 }
 
-// processOne 把事件纳入堆并驱动级联处理。注意：缺口等待期间，当前事件的
-// workItem.done 不能提前关闭，否则投递方误以为已完成；只有事件被真正
-// finalize 或判定为缺口暂缓时才给予相应处理。缺口事件的 workItem 保存在
-// 堆里，由后续 advance 在其被应用时关闭。
-func (c *keyCoordinator) processOne(wi *workItem) {
+func (c *keyCoordinator) processOne(item queuedItem) {
 	c.mu.Lock()
-	if !heapContains(c.waitHeap, wi.ev.ev.ID) {
-		heap.Push(&c.waitHeap, wi)
-	} else {
-		wi.finish() // 重复进入：以既有 workItem 为准，立即放行投递方
+	if !heapContains(c.waitHeap, item.ev.ID) {
+		heap.Push(&c.waitHeap, item)
 	}
 	c.mu.Unlock()
 	c.advance()
 }
 
-// advance 连续处理堆顶序号衔接的事件；遇到缺口则等待前驱（事件保留在堆，
-// 其投递 worker 阻塞在 done 上——这正是“按键背压”，前驱完成后会解除）。
+// advance 连续处理堆顶序号衔接的事件，直到遇到缺口或堆空。
 func (c *keyCoordinator) advance() {
+	ctx, cancel := context.WithCancel(context.Background())
+	stopSub := make(chan struct{})
+	go func() {
+		select {
+		case <-c.eng.finishCh:
+			cancel()
+		case <-stopSub:
+		case <-ctx.Done():
+		}
+	}()
+	defer func() { close(stopSub); cancel() }()
+
 	for {
 		c.mu.Lock()
 		if c.waitHeap.Len() == 0 {
@@ -129,54 +129,33 @@ func (c *keyCoordinator) advance() {
 		top := c.waitHeap[0]
 		c.mu.Unlock()
 
-		ctx, cancel := context.WithCancel(context.Background())
-		stopSub := make(chan struct{})
-		go func() {
-			select {
-			case <-c.eng.finishCh:
-				cancel()
-			case <-ctx.Done():
-			case <-stopSub:
-			}
-		}()
-
-		cur, ok, gerr := c.eng.store.Get(ctx, top.ev.ev.Key)
+		cur, ok, gerr := c.eng.store.Get(ctx, top.ev.Key)
 		if gerr != nil {
 			c.mu.Lock()
 			heap.Pop(&c.waitHeap)
 			c.mu.Unlock()
-			c.eng.finalize(top.ev, OutcomeFailed, normalize("engine.order.get", gerr))
-			top.finish()
-			close(stopSub)
-			cancel()
+			c.eng.finalize(top, OutcomeFailed, normalize("engine.order.get", gerr))
 			continue
 		}
 		version := int64(0)
 		if ok {
 			version = cur.Version
 		}
-		if top.ev.ev.Seq > version+1 {
-			// 缺口：释放投递该事件的 worker（不占用线程），事件留在堆中。
-			// 前驱事件到达时会由它自己的 processOne->advance 在同协程内
-			// 级联把本事件及后续连续事件一起处理，因此无需该 worker 等待。
-			close(stopSub)
-			cancel()
-			top.finish()
+		if top.ev.Seq > version+1 {
+			// 缺口：事件留在堆中，投递 worker 早已释放；前驱到达后会再次
+			// 进入 advance 并级联处理本事件。
 			return
 		}
 		c.mu.Lock()
 		heap.Pop(&c.waitHeap)
 		c.mu.Unlock()
 
-		outcome, perr := c.eng.processWithRetry(top.ev)
-		c.eng.finalize(top.ev, outcome, perr)
-		top.finish()
-		close(stopSub)
-		cancel()
+		outcome, perr := c.eng.processWithRetry(top)
+		c.eng.finalize(top, outcome, perr)
 	}
 }
 
-// sequencer 管理全部业务键的协调协程（懒创建）。
+// sequencer 管理全部业务键协调协程（懒创建）。
 type sequencer struct {
 	mu   sync.Mutex
 	keys map[string]*keyCoordinator
@@ -236,9 +215,41 @@ func (e *Engine) stopCoordinators() {
 	}
 }
 
+// countingSem 是一个有界在途信号量：限制“已被引擎接收但尚未最终结论”的
+// 事件总数，从而在处理能力不足时通过有界队列形成明确背压。
+type countingSem struct {
+	ch chan struct{}
+}
+
+func newCountingSem(n int) *countingSem {
+	if n <= 0 {
+		n = 1
+	}
+	return &countingSem{ch: make(chan struct{}, n)}
+}
+
+// acquire 占用一个槽位，阻塞直到有空位或 stop 关闭（返回 false）。
+func (s *countingSem) acquire(stop <-chan struct{}) bool {
+	select {
+	case s.ch <- struct{}{}:
+		return true
+	case <-stop:
+		return false
+	}
+}
+
+func (s *countingSem) release() {
+	select {
+	case <-s.ch:
+	default:
+	}
+}
+
+func (s *countingSem) inflight() int { return len(s.ch) }
+
 func heapContains(h pendingHeap, id string) bool {
-	for _, wi := range h {
-		if wi.ev.ev.ID == id {
+	for _, it := range h {
+		if it.ev.ID == id {
 			return true
 		}
 	}

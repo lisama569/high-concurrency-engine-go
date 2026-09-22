@@ -84,12 +84,17 @@ func (q *shardedQueue) safeSend(ch chan queuedItem, item queuedItem) (ok bool) {
 	}
 }
 
-// blockingSend 在队列已满时按截止时间阻塞等待空位。
+// blockingSend 在队列已满（进入本函数即代表快路径 safeSend 失败）时，按
+// 截止时间等待空位。等待期间 ctx 到期一律视为“容量背压等待超时”，归类为
+// KindQueueFull；只有停机信号归类为 KindStopping。外部 ctx 被主动取消归
+// KindCanceled。
 func (q *shardedQueue) blockingSend(ch chan queuedItem, item queuedItem, ctx context.Context) *Error {
 	const op = "queue.submit"
-	if q.isStopping() {
-		return newError(KindStopping, op,
-			"engine is shutting down; event retained in durable journal for replay", nil)
+	// 区分“因 SubmitTimeout 到期”与“外部主动取消”：WithTimeout 的截止错误
+	// 在队列满场景下按背压归类。
+	queueFullErr := func() *Error {
+		return newError(KindQueueFull, op,
+			"bounded queue full; submit timed out under backpressure", ctx.Err())
 	}
 	ticker := time.NewTicker(200 * time.Microsecond)
 	defer ticker.Stop()
@@ -102,12 +107,12 @@ func (q *shardedQueue) blockingSend(ch chan queuedItem, item queuedItem, ctx con
 			return newError(KindStopping, op,
 				"engine is shutting down; event retained in durable journal for replay", nil)
 		}
-		if ctx.Err() == context.DeadlineExceeded {
-			return newError(KindQueueFull, op,
-				"bounded queue full; submit timed out under backpressure", ctx.Err())
-		}
 		if err := ctx.Err(); err != nil {
-			return normalize(op, err)
+			// 能走到这里说明队列满：deadline 到期=背压；主动取消=取消。
+			if err == context.DeadlineExceeded {
+				return queueFullErr()
+			}
+			return newError(KindCanceled, op, "submit canceled while queue full", err)
 		}
 		select {
 		case <-q.stopCh:
@@ -115,10 +120,9 @@ func (q *shardedQueue) blockingSend(ch chan queuedItem, item queuedItem, ctx con
 				"engine is shutting down; event retained in durable journal for replay", nil)
 		case <-ctx.Done():
 			if ctx.Err() == context.DeadlineExceeded {
-				return newError(KindQueueFull, op,
-					"bounded queue full; submit timed out under backpressure", ctx.Err())
+				return queueFullErr()
 			}
-			return normalize(op, ctx.Err())
+			return newError(KindCanceled, op, "submit canceled while queue full", ctx.Err())
 		case <-ticker.C:
 		}
 	}

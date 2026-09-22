@@ -34,6 +34,8 @@ type Engine struct {
 
 	// sequencer 负责按业务键 Seq 的重排序与按序生效。
 	sequencer *sequencer
+	// inflightSem 限制系统中“已接收待结论”的事件总数，构成处理侧背压。
+	inflightSem *countingSem
 }
 
 // New 按配置构造引擎；此时不创建任何文件。
@@ -87,6 +89,9 @@ func (e *Engine) Start(ctx context.Context) error {
 	e.queue = newShardedQueue(e.cfg.Workers, e.cfg.QueuePerShard)
 	e.metrics = newMetrics(e.queue.capacity(), e.queue.depth)
 	e.sequencer = newSequencer()
+	// 在途上限 = 队列总容量 + 每键 mailbox 总量上界，给处理侧留足缓冲，
+	// 超出后事件停留在有界队列并按 SubmitTimeout 触发容量背压。
+	e.inflightSem = newCountingSem(e.queue.capacity() + e.cfg.Workers*e.cfg.MailboxPerKey)
 
 	// 启动 worker（与队列分片一一对应，保证同键串行）。
 	for i := 0; i < e.cfg.Workers; i++ {
@@ -195,25 +200,16 @@ func (e *Engine) Submit(ctx context.Context, ev Event) *Error {
 	return nil
 }
 
-// runWorker 消费一个分片，把每个事件路由到其业务键的串行协调协程。同键
-// 顺序由 keyCoordinator 保证；不同键的协调协程彼此并行。
+// runWorker 消费一个分片，把每个事件路由到其业务键的串行协调协程。投递
+// 是异步的：worker 仅负责把事件送进协调 mailbox（受全局在途信号量约束），
+// 不等待处理完成，因此序号缺口或慢处理都不会长期占用 worker 线程。
 func (e *Engine) runWorker(idx int) {
 	defer e.wg.Done()
 	ch := e.queue.shardChan(idx)
 	for item := range ch {
-		e.metrics.incInFlight()
-		// deliver 在该键 mailbox 满时会阻塞等待空位（或停机返回 false）。
-		// mailbox 容量按同键突发设计，正常不会长期阻塞；不同键不互相阻塞。
-		delivered := e.dispatch(item)
-		if !delivered {
-			// 停机导致未能交付：不 Ack，事件保留在 pending.log 中重放。
-			e.metrics.decInFlight()
-			continue
-		}
-		// 已交给协调协程：在途生命周期由事件完成（Ack）时通过 metrics 反映。
-		// 这里的在途计数在事件真正出队即计入，协调协程完成后通过队列深度与
-		// outstandingCount 共同判定排空。
-		e.metrics.decInFlight()
+		// dispatch 返回 false（停机/背压）时事件未给出结论、不 Ack，保留在
+		// pending.log 中由下次启动重放。
+		_ = e.dispatch(item)
 	}
 }
 
