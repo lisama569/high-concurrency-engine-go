@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"context"
 	"sync"
+	"time"
 )
 
 // pendingHeap 是某个业务键上因序号缺口而暂缓的事件最小序号堆。
@@ -25,10 +26,8 @@ const defaultMailboxCap = 256
 
 // keyCoordinator 是单个业务键的串行处理 actor。同键事件全部进入 mailbox，
 // 由唯一协程按 Seq 顺序生效：衔接的处理，缺口的入堆等待前驱，前驱应用后
-// 级联处理堆顶连续事件。
-//
-// 投递是异步的：worker 把事件放入 mailbox（经全局在途信号量限并发）后立即
-// 返回，不阻塞等待处理完成，因此“序号缺口”不会占用任何 worker 线程。
+// 级联处理堆顶连续事件。投递异步：worker 放入 mailbox 后即返回，序号缺口
+// 不占用 worker。
 type keyCoordinator struct {
 	eng     *Engine
 	key     string
@@ -37,7 +36,10 @@ type keyCoordinator struct {
 	mu       sync.Mutex
 	waitHeap pendingHeap
 	busy     bool
-	wg       sync.WaitGroup
+	// hasWork 在“mailbox 为空但 waitHeap 中可能存在可推进事件”时作为兜底
+	// 唤醒信号：advance 应用前驱后若堆里还有事件，会非阻塞触发一次自调度。
+	reschedule chan struct{}
+	wg         sync.WaitGroup
 }
 
 func newKeyCoordinator(eng *Engine, key string) *keyCoordinator {
@@ -46,18 +48,27 @@ func newKeyCoordinator(eng *Engine, key string) *keyCoordinator {
 		capN = defaultMailboxCap
 	}
 	c := &keyCoordinator{
-		eng:     eng,
-		key:     key,
-		mailbox: make(chan queuedItem, capN),
+		eng:        eng,
+		key:        key,
+		mailbox:    make(chan queuedItem, capN),
+		reschedule: make(chan struct{}, 1),
 	}
 	c.wg.Add(1)
 	go c.run()
 	return c
 }
 
-// deliver 异步投递：先占用一个全局在途槽位（限制系统中被接收待处理的事件
-// 总量，构成背压），再把事件放入该键 mailbox。mailbox 满或停机时释放槽位
-// 并返回 false，调用方按队列背压/停机处理（事件保留在持久日志中）。
+// kick 非阻塞地请求协调协程再跑一次 advance（用于前驱应用后推进堆顶后继）。
+func (c *keyCoordinator) kick() {
+	select {
+	case c.reschedule <- struct{}{}:
+	default:
+	}
+}
+
+// deliver 投递事件到该键 mailbox。mailbox 满时阻塞等待空位（天然对慢业务
+// 键形成背压，且只阻塞投递该键的 worker，不影响其它键）；停机则返回
+// false。在途槽位在事件 finalize 时释放，恒等于“已接收未结论”数。
 func (c *keyCoordinator) deliver(item queuedItem) bool {
 	if !c.eng.inflightSem.acquire(c.eng.finishCh) {
 		return false
@@ -68,15 +79,16 @@ func (c *keyCoordinator) deliver(item queuedItem) bool {
 	case <-c.eng.finishCh:
 		c.eng.inflightSem.release()
 		return false
-	default:
-		// mailbox 满：该键处理能力不足，按容量背压拒绝，事件已在持久日志。
-		c.eng.inflightSem.release()
-		return false
 	}
 }
 
 func (c *keyCoordinator) run() {
 	defer c.wg.Done()
+	// settleTick 是兜底重扫节拍：当堆中留有事件但缺少精确 kick（例如前驱
+	// 在 kick 之后才入堆）时，周期性再跑一次 advance，保证最终收敛。正常
+	// 情况下由 mailbox 消息与 kick 即时驱动，tick 只增加极小开销。
+	settle := time.NewTicker(2 * time.Millisecond)
+	defer settle.Stop()
 	for {
 		select {
 		case <-c.eng.finishCh:
@@ -85,8 +97,19 @@ func (c *keyCoordinator) run() {
 			c.setBusy(true)
 			c.processOne(item)
 			c.setBusy(false)
-			// 事件走完最终结论（或确认暂缓）后释放一个在途槽位。
-			c.eng.inflightSem.release()
+		case <-c.reschedule:
+			c.setBusy(true)
+			c.advance()
+			c.setBusy(false)
+		case <-settle.C:
+			c.mu.Lock()
+			has := c.waitHeap.Len() > 0
+			c.mu.Unlock()
+			if has {
+				c.setBusy(true)
+				c.advance()
+				c.setBusy(false)
+			}
 		}
 	}
 }
@@ -106,20 +129,17 @@ func (c *keyCoordinator) processOne(item queuedItem) {
 	c.advance()
 }
 
-// advance 连续处理堆顶序号衔接的事件，直到遇到缺口或堆空。
-func (c *keyCoordinator) advance() {
-	ctx, cancel := context.WithCancel(context.Background())
-	stopSub := make(chan struct{})
-	go func() {
-		select {
-		case <-c.eng.finishCh:
-			cancel()
-		case <-stopSub:
-		case <-ctx.Done():
-		}
-	}()
-	defer func() { close(stopSub); cancel() }()
+// handleOutcome 对一个已弹出堆的事件给出最终结论，并只在此时释放在途槽位。
+func (c *keyCoordinator) handleOutcome(item queuedItem) {
+	outcome, perr := c.eng.processWithRetry(item)
+	c.eng.finalize(item, outcome, perr)
+	c.eng.inflightSem.release()
+}
 
+// advance 从堆顶连续处理序号衔接的事件，直到遇到缺口或堆空。每次成功推进
+// 后 kick 自身一次，保证即便没有新 mailbox 消息，堆中已有的后继也会被
+// 继续评估（这是修复“前驱已在堆中但无人触发”的关键）。
+func (c *keyCoordinator) advance() {
 	for {
 		c.mu.Lock()
 		if c.waitHeap.Len() == 0 {
@@ -129,12 +149,26 @@ func (c *keyCoordinator) advance() {
 		top := c.waitHeap[0]
 		c.mu.Unlock()
 
+		ctx, cancel := context.WithCancel(context.Background())
+		stopSub := make(chan struct{})
+		go func() {
+			select {
+			case <-c.eng.finishCh:
+				cancel()
+			case <-stopSub:
+			case <-ctx.Done():
+			}
+		}()
+
 		cur, ok, gerr := c.eng.store.Get(ctx, top.ev.Key)
 		if gerr != nil {
 			c.mu.Lock()
 			heap.Pop(&c.waitHeap)
 			c.mu.Unlock()
 			c.eng.finalize(top, OutcomeFailed, normalize("engine.order.get", gerr))
+			c.eng.inflightSem.release()
+			close(stopSub)
+			cancel()
 			continue
 		}
 		version := int64(0)
@@ -142,16 +176,24 @@ func (c *keyCoordinator) advance() {
 			version = cur.Version
 		}
 		if top.ev.Seq > version+1 {
-			// 缺口：事件留在堆中，投递 worker 早已释放；前驱到达后会再次
-			// 进入 advance 并级联处理本事件。
+			// 缺口：事件留在堆中；不释放槽位（仍未结论）。前驱应用后会
+			// kick 触发重新评估。
+			close(stopSub)
+			cancel()
 			return
 		}
 		c.mu.Lock()
 		heap.Pop(&c.waitHeap)
+		remaining := c.waitHeap.Len()
 		c.mu.Unlock()
 
-		outcome, perr := c.eng.processWithRetry(top)
-		c.eng.finalize(top, outcome, perr)
+		c.handleOutcome(top)
+		close(stopSub)
+		cancel()
+
+		if remaining > 0 {
+			c.kick()
+		}
 	}
 }
 
@@ -176,8 +218,7 @@ func (e *Engine) dispatch(item queuedItem) bool {
 	return k.deliver(item)
 }
 
-// outstandingCount 返回所有键 mailbox、缺口堆与处理中事件的总数，供停机
-// 排空判定。
+// outstandingCount 返回所有键 mailbox、缺口堆与处理中事件的总数。
 func (e *Engine) outstandingCount() int {
 	e.sequencer.mu.Lock()
 	ks := make([]*keyCoordinator, 0, len(e.sequencer.keys))
@@ -215,11 +256,8 @@ func (e *Engine) stopCoordinators() {
 	}
 }
 
-// countingSem 是一个有界在途信号量：限制“已被引擎接收但尚未最终结论”的
-// 事件总数，从而在处理能力不足时通过有界队列形成明确背压。
-type countingSem struct {
-	ch chan struct{}
-}
+// countingSem 是有界在途信号量，槽位数 = 已接收但尚未 finalize 的事件数。
+type countingSem struct{ ch chan struct{} }
 
 func newCountingSem(n int) *countingSem {
 	if n <= 0 {
@@ -228,7 +266,6 @@ func newCountingSem(n int) *countingSem {
 	return &countingSem{ch: make(chan struct{}, n)}
 }
 
-// acquire 占用一个槽位，阻塞直到有空位或 stop 关闭（返回 false）。
 func (s *countingSem) acquire(stop <-chan struct{}) bool {
 	select {
 	case s.ch <- struct{}{}:

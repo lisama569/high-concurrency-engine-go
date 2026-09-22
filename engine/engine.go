@@ -200,16 +200,40 @@ func (e *Engine) Submit(ctx context.Context, ev Event) *Error {
 	return nil
 }
 
-// runWorker 消费一个分片，把每个事件路由到其业务键的串行协调协程。投递
-// 是异步的：worker 仅负责把事件送进协调 mailbox（受全局在途信号量约束），
-// 不等待处理完成，因此序号缺口或慢处理都不会长期占用 worker 线程。
+// runWorker 消费一个分片，把每个事件路由到其业务键的串行协调协程。
+//
+// dispatch 可能因为：
+//   - 目标键 mailbox 满（该键处理能力不足）：不能静默丢弃，把事件退回分片
+//     队列稍后重试；队列也满则短退避后重试，直到停机（事件始终在队列或
+//     mailbox 中，且持久日志兜底，绝不丢失）；
+//   - 停机 finishCh 关闭：放弃重试，事件未 Ack，保留在 pending.log 重放。
 func (e *Engine) runWorker(idx int) {
 	defer e.wg.Done()
 	ch := e.queue.shardChan(idx)
 	for item := range ch {
-		// dispatch 返回 false（停机/背压）时事件未给出结论、不 Ack，保留在
-		// pending.log 中由下次启动重放。
-		_ = e.dispatch(item)
+		for {
+			if e.dispatch(item) {
+				break
+			}
+			if e.isFinish() {
+				break // 停机：不 Ack，事件随日志重放
+			}
+			// mailbox 背压：退回队列重试。非阻塞放回（当前就是从该通道取
+			// 出，必有空位），再让出时间片给目标键协调协程追赶。
+			if !e.queue.trySend(idx, item) {
+				time.Sleep(200 * time.Microsecond)
+			}
+		}
+	}
+}
+
+// isFinish 报告引擎是否已进入最终收尾阶段（finishCh 关闭）。
+func (e *Engine) isFinish() bool {
+	select {
+	case <-e.finishCh:
+		return true
+	default:
+		return false
 	}
 }
 
