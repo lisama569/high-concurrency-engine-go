@@ -20,6 +20,10 @@ func testConfig(t *testing.T) Config {
 	cfg.MaxAttempts = 3
 	cfg.Backoff = time.Millisecond
 	cfg.ShutdownTimeout = 3 * time.Second
+	// 测试默认使用组提交异步持久化：吞吐高且不受沙箱磁盘 fsync 物理延迟
+	// 干扰；崩溃一致性由事件源 offset 重投 + 存储幂等保证，优雅停机会完整
+	// 落盘。强同步模式由专门用例单独覆盖。
+	cfg.SyncEachWrite = false
 	return cfg
 }
 
@@ -49,13 +53,6 @@ func TestConcurrentOrderingAndTotals(t *testing.T) {
 
 	const goroutines = 16
 	const perKey = 150
-	// 独占键事件天然按序号单调投递（无缺口、无暂缓），给足队列容量避免
-	// 容量背压干扰“不重不漏”判定；背压拒绝由专门用例覆盖。
-	savedCap := cfg.QueuePerShard
-	savedTimeout := cfg.SubmitTimeout
-	cfg.QueuePerShard = 1024
-	cfg.SubmitTimeout = 200 * time.Millisecond
-	defer func() { cfg.QueuePerShard = savedCap; cfg.SubmitTimeout = savedTimeout }()
 	var wg sync.WaitGroup
 	for g := 0; g < goroutines; g++ {
 		wg.Add(1)

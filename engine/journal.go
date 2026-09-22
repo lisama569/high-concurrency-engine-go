@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,63 +14,61 @@ import (
 // Journal 是“待处理事件日志”（持久化有界队列的落盘部分）。
 //
 // 事件在进入内存有界队列前先被追加（Append），处理成功后确认（Ack）。
-// 停机时仍未 Ack 的事件会在下次启动时通过 Replay 重放；由于状态写入具备
-// 幂等判重，重放不会造成重复应用。
-//
-// 文件布局（逐行 JSON，单文件）：
-//
-//	{"type":"add","event":{...}}
-//	{"type":"ack","id":"..."}
-//
-// Close 时按当前未完成集合压缩重写，避免日志无限增长。
+// 停机时仍未 Ack 的事件会在下次启动通过 Replay 重放；存储层幂等保证重放
+// 不会重复应用。文件为逐行 JSON（add / ack），Close 时按未完成集合压缩。
 type Journal interface {
-	// Append 持久化一个待处理事件。
 	Append(ctx context.Context, ev Event) error
-	// Ack 标记一个事件已处理完成。
 	Ack(ctx context.Context, eventID string) error
-	// Replay 返回所有尚未 Ack 的事件（保持追加顺序）。
+	// AckAsync 把确认写入日志缓冲并由组提交异步落盘后立即返回。Ack 丢失
+	// 的唯一后果是重启时该事件被多做一次（存储层幂等会判重跳过），因此可
+	// 安全异步，用于消除处理热路径上的第二次 fsync。
+	AckAsync(eventID string) error
 	Replay(ctx context.Context) ([]Event, error)
-	// Pending 返回尚未 Ack 的事件数量。
 	Pending() int
-	// Close 重写压缩日志并关闭。
 	Close() error
 }
 
 type journalLine struct {
-	Type  string `json:"type"` // "add" 或 "ack"
+	Type  string `json:"type"`
 	Event *Event `json:"event,omitempty"`
 	ID    string `json:"id,omitempty"`
 }
 
-type fileJournal struct {
-	mu       sync.Mutex
-	path     string
-	f        *os.File
-	w        *bufio.Writer
-	pending  map[string]Event // id -> 事件，同时保留首次出现顺序于 order
-	order    []string
-	closed   bool
-	syncEach bool
+// journalCommitInterval 是强持久化模式下组提交的聚合窗口。窗口内的所有
+// add/ack 由同一次 flush+fsync 覆盖；高并发下 fsync 次数从“每事件一次”
+// 降到“每窗口一次”，而每个调用仍在自己那批落盘后才返回。
+const journalCommitInterval = 500 * time.Microsecond
 
-	// 组提交：dirty 表示缓冲有未落盘字节；commit 协程按固定节拍一次
-	// flush+fsync 覆盖这一节拍内的所有 add/ack。
-	commitStop chan struct{}
-	commitDone chan struct{}
-	dirtyMu    sync.Mutex
-	dirty      bool
+type fileJournal struct {
+	mu      sync.Mutex // 保护缓冲写入、gen、内存索引与压缩
+	path    string
+	f       *os.File
+	w       *bufio.Writer
+	pending map[string]Event
+	order   []string
+	closed  bool
+	durable bool // Append/Ack 是否等待自己那批 fsync 完成
+
+	gen        uint64 // 已分配的最大代次
+	flushedGen uint64 // 已 flush+fsync 覆盖的最大代次
+	flushMu    sync.Mutex
+	flushCv    *sync.Cond
+	flushErr   error
+
+	reqCh         chan struct{}
+	committerStop chan struct{}
+	committerDone chan struct{}
 }
 
-// journalCommitInterval 是组提交刷盘节拍。
-const journalCommitInterval = 2 * 1000 * 1000 // 2ms（纳秒）
-
-// openJournal 以每行 fsync 的强持久化级别打开待处理日志。
 func openJournal(path string) (Journal, error) {
 	return openJournalWith(path, true)
 }
 
-// openJournalWith 打开待处理日志。syncEach=false 时采用组提交（后台节拍
-// 刷盘），吞吐显著提高；进程崩溃可能丢失最近一个节拍内的待处理记录，但
-// 这些事件通常仍停留在事件源 offset 之前，重启会重新投递（幂等兜底）。
+// openJournalWith 打开待处理日志。两种持久化级别都使用组提交协程，区别
+// 仅在于 Append/Ack 是否等待自己那批被 fsync：
+//   - syncEach=true：等待落盘后才返回（崩溃不丢已确认写入）；
+//   - syncEach=false：写入缓冲即返回（崩溃可能丢失最近窗口内记录，事件
+//     源 offset 未推进，重启重新投递兜底）。
 func openJournalWith(path string, syncEach bool) (Journal, error) {
 	const op = "journal.open"
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -82,52 +79,24 @@ func openJournalWith(path string, syncEach bool) (Journal, error) {
 		return nil, newError(KindStorage, op, "open: "+err.Error(), err)
 	}
 	j := &fileJournal{
-		path:       path,
-		f:          f,
-		w:          bufio.NewWriterSize(f, 64*1024),
-		pending:    make(map[string]Event),
-		syncEach:   syncEach,
-		commitStop: make(chan struct{}),
-		commitDone: make(chan struct{}),
+		path:          path,
+		f:             f,
+		w:             bufio.NewWriterSize(f, 64*1024),
+		pending:       make(map[string]Event),
+		reqCh:         make(chan struct{}, 1),
+		committerStop: make(chan struct{}),
+		committerDone: make(chan struct{}),
 	}
+	j.flushCv = sync.NewCond(&j.flushMu)
+	j.durable = syncEach
 	if err := j.load(); err != nil {
 		return nil, err
 	}
-	// 把追加位置移动到文件尾。
 	if _, err := f.Seek(0, io.SeekEnd); err != nil {
 		return nil, newError(KindStorage, op, "seek end: "+err.Error(), err)
 	}
-	if !syncEach {
-		go j.runCommit()
-	}
+	go j.runCommitter()
 	return j, nil
-}
-
-// runCommit 周期性把脏缓冲 flush+fsync（组提交）。
-func (j *fileJournal) runCommit() {
-	defer close(j.commitDone)
-	t := time.NewTicker(time.Duration(journalCommitInterval))
-	defer t.Stop()
-	for {
-		select {
-		case <-j.commitStop:
-			return
-		case <-t.C:
-			j.dirtyMu.Lock()
-			dirty := j.dirty
-			j.dirtyMu.Unlock()
-			if !dirty {
-				continue
-			}
-			j.mu.Lock()
-			_ = j.w.Flush()
-			_ = j.f.Sync()
-			j.mu.Unlock()
-			j.dirtyMu.Lock()
-			j.dirty = false
-			j.dirtyMu.Unlock()
-		}
-	}
 }
 
 func (j *fileJournal) load() error {
@@ -163,7 +132,6 @@ func (j *fileJournal) load() error {
 	if err := sc.Err(); err != nil {
 		return newError(KindStorage, op, "scan: "+err.Error(), err)
 	}
-	// 重建 order，剔除已 Ack 的条目。
 	order := j.order[:0]
 	for _, id := range j.order {
 		if _, ok := j.pending[id]; ok {
@@ -174,9 +142,47 @@ func (j *fileJournal) load() error {
 	return nil
 }
 
-// writeLineLocked 在已持有 j.mu 时写入一行；按持久化级别决定是否立即
-// flush+fsync，否则只标记脏，由 runCommit 组提交。
-func (j *fileJournal) writeLineLocked(l journalLine) error {
+// runCommitter 是唯一执行 flush+fsync 的协程。
+func (j *fileJournal) runCommitter() {
+	defer close(j.committerDone)
+	for {
+		select {
+		case <-j.committerStop:
+			return
+		case <-j.reqCh:
+		}
+		select {
+		case <-j.committerStop:
+			return
+		case <-time.After(journalCommitInterval):
+		}
+		j.mu.Lock()
+		ferr := j.w.Flush()
+		var serr error
+		if ferr == nil {
+			serr = j.f.Sync()
+		}
+		gen := j.gen
+		j.mu.Unlock()
+
+		j.flushMu.Lock()
+		switch {
+		case ferr != nil:
+			j.flushErr = newError(KindStorage, "journal.commit", "flush: "+ferr.Error(), ferr)
+		case serr != nil:
+			j.flushErr = newError(KindStorage, "journal.commit", "sync: "+serr.Error(), serr)
+		default:
+			j.flushErr = nil
+			j.flushedGen = gen
+		}
+		j.flushCv.Broadcast()
+		j.flushMu.Unlock()
+	}
+}
+
+// writeLocked 在持有 j.mu 时写入一行、分配代次并按 durableWait 决定是否
+// 等待自己那批 fsync 完成。
+func (j *fileJournal) writeLocked(l journalLine, durableWait bool) error {
 	const op = "journal.write"
 	data, err := json.Marshal(&l)
 	if err != nil {
@@ -188,20 +194,26 @@ func (j *fileJournal) writeLineLocked(l journalLine) error {
 	if err := j.w.WriteByte('\n'); err != nil {
 		return newError(KindStorage, op, "write: "+err.Error(), err)
 	}
-	if j.syncEach {
-		if err := j.w.Flush(); err != nil {
-			return newError(KindStorage, op, "flush: "+err.Error(), err)
-		}
-		if err := j.f.Sync(); err != nil {
-			return newError(KindStorage, op, "sync: "+err.Error(), err)
-		}
-		return nil
+	j.gen++
+	myGen := j.gen
+	select {
+	case j.reqCh <- struct{}{}:
+	default:
 	}
-	// 组提交：标记脏即可，节拍协程负责落盘。
-	j.dirtyMu.Lock()
-	j.dirty = true
-	j.dirtyMu.Unlock()
-	return nil
+
+	if !durableWait {
+		return nil // 异步：交给 committer 稍后落盘
+	}
+
+	j.mu.Unlock()
+	j.flushMu.Lock()
+	for j.flushedGen < myGen && j.flushErr == nil {
+		j.flushCv.Wait()
+	}
+	err = j.flushErr
+	j.flushMu.Unlock()
+	j.mu.Lock()
+	return err
 }
 
 func (j *fileJournal) Append(ctx context.Context, ev Event) error {
@@ -214,7 +226,7 @@ func (j *fileJournal) Append(ctx context.Context, ev Event) error {
 	if j.closed {
 		return newError(KindStorage, op, "journal closed", nil)
 	}
-	if err := j.writeLineLocked(journalLine{Type: "add", Event: &ev}); err != nil {
+	if err := j.writeLocked(journalLine{Type: "add", Event: &ev}, j.durable); err != nil {
 		return err
 	}
 	if _, ok := j.pending[ev.ID]; !ok {
@@ -234,7 +246,20 @@ func (j *fileJournal) Ack(ctx context.Context, eventID string) error {
 	if j.closed {
 		return newError(KindStorage, op, "journal closed", nil)
 	}
-	if err := j.writeLineLocked(journalLine{Type: "ack", ID: eventID}); err != nil {
+	if err := j.writeLocked(journalLine{Type: "ack", ID: eventID}, j.durable); err != nil {
+		return err
+	}
+	delete(j.pending, eventID)
+	return nil
+}
+
+func (j *fileJournal) AckAsync(eventID string) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.closed {
+		return newError(KindStorage, "journal.ackAsync", "journal closed", nil)
+	}
+	if err := j.writeLocked(journalLine{Type: "ack", ID: eventID}, false); err != nil {
 		return err
 	}
 	delete(j.pending, eventID)
@@ -259,7 +284,7 @@ func (j *fileJournal) Pending() int {
 	return len(j.pending)
 }
 
-// compactLocked 把当前未完成集合压缩重写到临时文件并原子替换。
+// compactLocked 把当前未完成集合压缩重写到临时文件并原子替换（持 j.mu）。
 func (j *fileJournal) compactLocked() error {
 	const op = "journal.compact"
 	tmp := j.path + ".tmp"
@@ -309,12 +334,10 @@ func (j *fileJournal) compactLocked() error {
 }
 
 func (j *fileJournal) Close() error {
-	// 组提交模式：先停止节拍协程，并把残留缓冲强制落盘，保证优雅停机不
-	// 丢最近一个节拍内的 add/ack。
-	if !j.syncEach {
-		close(j.commitStop)
-		<-j.commitDone
-	}
+	// 停止提交协程并强制把残留缓冲落盘。
+	close(j.committerStop)
+	<-j.committerDone
+
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.closed {
@@ -322,16 +345,16 @@ func (j *fileJournal) Close() error {
 	}
 	j.closed = true
 	var firstErr error
-	if err := j.w.Flush(); err != nil && firstErr == nil {
+	if err := j.w.Flush(); err == nil {
+		if serr := j.f.Sync(); serr != nil {
+			firstErr = newError(KindStorage, "journal.close", "sync: "+serr.Error(), serr)
+		}
+	} else {
 		firstErr = newError(KindStorage, "journal.close", "flush: "+err.Error(), err)
-	}
-	if err := j.f.Sync(); err != nil && firstErr == nil {
-		firstErr = newError(KindStorage, "journal.close", "sync: "+err.Error(), err)
 	}
 	if err := j.compactLocked(); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	// 压缩已用新文件替换旧文件，旧句柄直接关闭即可。
 	if err := j.f.Close(); err != nil && firstErr == nil {
 		firstErr = newError(KindStorage, "journal.close", "close: "+err.Error(), err)
 	}
@@ -353,13 +376,14 @@ type dlqLine struct {
 	Retryable bool   `json:"retryable"`
 }
 
+// fileDeadLetter 是追加式逐行 JSON 死信文件。写入量很小（仅最终失败的
+// 事件），直接逐次 flush+fsync 以保证失败记录不丢。
 type fileDeadLetter struct {
 	mu sync.Mutex
 	f  *os.File
 	w  *bufio.Writer
 }
 
-// openDeadLetter 打开/创建死信文件（追加式逐行 JSON）。
 func openDeadLetter(path string) (DeadLetter, error) {
 	const op = "dlq.open"
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -375,7 +399,7 @@ func openDeadLetter(path string) (DeadLetter, error) {
 func (d *fileDeadLetter) Write(ev Event, reason *Error) error {
 	const op = "dlq.write"
 	if reason == nil {
-		reason = newError(KindUnknown, op, "unspecified failure", errors.New("nil reason"))
+		reason = newError(KindUnknown, op, "unspecified failure", nil)
 	}
 	line := dlqLine{
 		Event:     ev,

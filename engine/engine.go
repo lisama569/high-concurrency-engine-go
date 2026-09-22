@@ -237,9 +237,8 @@ func (e *Engine) finalize(item queuedItem, outcome Outcome, perr *Error) {
 	switch outcome {
 	case OutcomeApplied, OutcomeDuplicate, OutcomeConflict:
 		e.metrics.recordOutcome(outcome)
-		if aerr := e.journal.Ack(context.Background(), ev.ID); aerr != nil {
-			_ = aerr // 重启可能重放，存储层幂等保证结果不变
-		}
+		// Ack 异步落盘：即使丢失，重启重放也会被存储层判重，安全。
+		_ = e.journal.AckAsync(ev.ID)
 		return
 	}
 	if perr != nil && perr.Kind == KindCanceled {
@@ -252,7 +251,7 @@ func (e *Engine) finalize(item queuedItem, outcome Outcome, perr *Error) {
 	if werr := e.dlq.Write(ev, perr); werr != nil {
 		return // 死信落盘失败：不 Ack，保留重放
 	}
-	_ = e.journal.Ack(context.Background(), ev.ID)
+	_ = e.journal.AckAsync(ev.ID)
 }
 
 // processWithRetry 对一个已轮到序号的事件执行有界退避重试，返回最终结论。
