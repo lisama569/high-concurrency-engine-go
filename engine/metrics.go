@@ -12,7 +12,6 @@ type MetricsSnapshot struct {
 	Accepted   int64 // 成功进入有界队列的事件数
 	Rejected   int64 // 因背压等原因被拒绝的事件数
 	InFlight   int64 // 正在处理中的事件数
-	Deferred   int64 // 因序号缺口暂缓、尚未完成的事件数
 	Applied    int64 // 正常应用的事件数
 	Duplicates int64 // 幂等判重跳过的事件数
 	Conflicts  int64 // 状态冲突被标记的事件数
@@ -31,7 +30,6 @@ type Metrics struct {
 	accepted   atomic.Int64
 	rejected   atomic.Int64
 	inFlight   atomic.Int64
-	deferred   atomic.Int64 // 因序号缺口暂缓、尚未最终完成的事件数
 	applied    atomic.Int64
 	duplicates atomic.Int64
 	conflicts  atomic.Int64
@@ -69,8 +67,6 @@ func (m *Metrics) recordRejected(kind ErrorKind) {
 
 func (m *Metrics) incInFlight() { m.inFlight.Add(1) }
 func (m *Metrics) decInFlight() { m.inFlight.Add(-1) }
-func (m *Metrics) incDeferred() { m.deferred.Add(1) }
-func (m *Metrics) decDeferred() { m.deferred.Add(-1) }
 
 func (m *Metrics) recordOutcome(o Outcome) {
 	switch o {
@@ -105,7 +101,6 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		Accepted:     m.accepted.Load(),
 		Rejected:     m.rejected.Load(),
 		InFlight:     m.inFlight.Load(),
-		Deferred:     m.deferred.Load(),
 		Applied:      m.applied.Load(),
 		Duplicates:   m.duplicates.Load(),
 		Conflicts:    m.conflicts.Load(),

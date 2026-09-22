@@ -20,10 +20,9 @@ type queuedItem struct {
 // 并行。队列满时 Submit 按 ctx 截止时间等待，超时以 KindQueueFull 明确拒
 // 绝，停机期间以 KindStopping 拒绝，两种背压原因可区分，事件不被静默丢弃。
 type shardedQueue struct {
-	shards   []chan queuedItem
-	mask     uint64
-	capPer   int
-	enqueued atomic.Int64
+	shards []chan queuedItem
+	mask   uint64
+	capPer int
 
 	stopOnce sync.Once
 	stopCh   chan struct{} // markStopping 时关闭
@@ -100,7 +99,6 @@ func (q *shardedQueue) blockingSend(ch chan queuedItem, item queuedItem, ctx con
 	defer ticker.Stop()
 	for {
 		if q.safeSend(ch, item) {
-			q.enqueued.Add(1)
 			return nil
 		}
 		if q.isStopping() {
@@ -136,7 +134,6 @@ func (q *shardedQueue) Submit(ctx context.Context, item queuedItem) *Error {
 	}
 	ch := q.shards[q.shardOf(item.ev.Key)]
 	if q.safeSend(ch, item) {
-		q.enqueued.Add(1)
 		return nil
 	}
 	return q.blockingSend(ch, item, ctx)
@@ -151,8 +148,6 @@ func (q *shardedQueue) isStopping() bool {
 		return false
 	}
 }
-
-func (q *shardedQueue) isClosed() bool { return q.closed.Load() }
 
 func (q *shardedQueue) trySend(idx int, item queuedItem) bool {
 	return q.safeSend(q.shards[idx], item)

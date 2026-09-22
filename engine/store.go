@@ -110,10 +110,6 @@ type fileStore struct {
 	applies atomic.Int64
 }
 
-func openStore(dataDir string) (Store, error) {
-	return openStoreWith(dataDir, true)
-}
-
 func openStoreWith(dataDir string, syncEach bool) (*fileStore, error) {
 	const op = "store.open"
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {

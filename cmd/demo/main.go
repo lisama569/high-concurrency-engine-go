@@ -36,12 +36,16 @@ func main() {
 	cfg := engine.DefaultConfig()
 	cfg.DataDir = dataDir
 	cfg.Workers = 8
-	cfg.QueuePerShard = 16   // 刻意很小，便于在演示中观察 queue_full 背压
-	cfg.SubmitTimeout = 2 * time.Millisecond
+	cfg.QueuePerShard = 16 // 刻意很小，便于在演示中观察 queue_full 背压
+	cfg.MailboxPerKey = 16
+	cfg.SubmitTimeout = 5 * time.Millisecond
 	cfg.MaxAttempts = 3
 	cfg.Backoff = time.Millisecond
 	cfg.HandleTimeout = 200 * time.Millisecond
 	cfg.ShutdownTimeout = 5 * time.Second
+	// 演示默认使用组提交异步持久化以获得高吞吐；进程崩溃由事件源 offset
+	// 重投 + 存储幂等兜底，优雅停机完整落盘。需要最强崩溃安全可改为 true。
+	cfg.SyncEachWrite = false
 
 	ctx := context.Background()
 
@@ -55,12 +59,35 @@ func main() {
 	logger.Printf("engine started: workers=%d queueMax=%d dataDir=%s",
 		cfg.Workers, cfg.Workers*cfg.QueuePerShard, dataDir)
 
-	// 高并发投递：8 个键 × 每键 200 个有序事件，另有重复与乱序事件。
+	// 高并发投递：32 个 goroutine 往 8 个业务键各投递 200 个有序事件。
+	// 队列容量刻意很小，处理能力不足时 Submit 会快速返回 queue_full；这里
+	// 生产端按该（可重试）原因退避重试，既演示背压，也保证最终全部生效、
+	// 结果可复现。拒绝原因被统计用于观察。
 	const goroutines = 32
 	const perKey = 200
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	rejects := map[string]int{}
+
+	submitWithRetry := func(ev engine.Event) {
+		for {
+			perr := eng.Submit(ctx, ev)
+			if perr == nil {
+				return
+			}
+			var ee *engine.Error
+			if errors.As(perr, &ee) {
+				mu.Lock()
+				rejects[ee.Kind.String()]++
+				mu.Unlock()
+				if ee.Kind == engine.KindQueueFull {
+					time.Sleep(time.Millisecond) // 背压：稍后重试，事件不丢
+					continue
+				}
+			}
+			return // 其它原因（如非法/停机）不重试
+		}
+	}
 
 	t0 := time.Now()
 	for g := 0; g < goroutines; g++ {
@@ -69,26 +96,19 @@ func main() {
 			defer wg.Done()
 			for i := 0; i < perKey; i++ {
 				key := fmt.Sprintf("k%d", g%8)
-				ev := engine.Event{
+				submitWithRetry(engine.Event{
 					ID:      fmt.Sprintf("e-%s-%d", key, i+1),
 					Key:     key,
 					Seq:     int64(i + 1),
 					Kind:    "add",
 					Payload: 1,
-				}
-				if perr := eng.Submit(ctx, ev); perr != nil {
-					var ee *engine.Error
-					if errors.As(perr, &ee) {
-						mu.Lock()
-						rejects[ee.Kind.String()]++
-						mu.Unlock()
-					}
-				}
+				})
 			}
 		}(g)
 	}
 	wg.Wait()
-	logger.Printf("burst finished in %v; rejects by reason: %v", time.Since(t0), rejects)
+	logger.Printf("burst finished in %v; backpressure rejections(retried) by reason: %v",
+		time.Since(t0), rejects)
 
 	// 追加重复投递：相同 ID 必须被幂等拦截。
 	dup := engine.Event{ID: "e-k0-1", Key: "k0", Seq: 1, Kind: "add", Payload: 1}
