@@ -12,12 +12,13 @@ type Engine struct {
 	cfg     Config
 	handler Handler
 
-	mu      sync.Mutex
-	started bool
-	stopped bool
-	stopCh  chan struct{} // 关闭表示开始优雅停机
-	doneCh  chan struct{} // 关闭表示所有后台协程已退出
-	wg      sync.WaitGroup
+	mu       sync.Mutex
+	started  bool
+	stopped  bool
+	stopCh   chan struct{} // 停机开始：拒绝新提交、取消事件源
+	finishCh chan struct{} // 排空结束或超时：终止协调协程与在途处理
+	doneCh   chan struct{} // 关闭表示所有后台协程已退出
+	wg       sync.WaitGroup
 
 	store   Store
 	journal Journal
@@ -44,10 +45,11 @@ func New(cfg Config, handler Handler) (*Engine, error) {
 		handler = SumHandler
 	}
 	return &Engine{
-		cfg:     cfg,
-		handler: handler,
-		stopCh:  make(chan struct{}),
-		doneCh:  make(chan struct{}),
+		cfg:      cfg,
+		handler:  handler,
+		stopCh:   make(chan struct{}),
+		finishCh: make(chan struct{}),
+		doneCh:   make(chan struct{}),
 	}, nil
 }
 
@@ -85,7 +87,6 @@ func (e *Engine) Start(ctx context.Context) error {
 	e.queue = newShardedQueue(e.cfg.Workers, e.cfg.QueuePerShard)
 	e.metrics = newMetrics(e.queue.capacity(), e.queue.depth)
 	e.sequencer = newSequencer()
-	e.sequencer.startPump(func() { e.requeueAllReady() })
 
 	// 启动 worker（与队列分片一一对应，保证同键串行）。
 	for i := 0; i < e.cfg.Workers; i++ {
@@ -137,7 +138,7 @@ func (e *Engine) submitCtx(parent context.Context) (context.Context, context.Can
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
 		select {
-		case <-e.stopCh:
+		case <-e.finishCh:
 			cancel()
 		case <-ctx.Done():
 		}
@@ -194,37 +195,25 @@ func (e *Engine) Submit(ctx context.Context, ev Event) *Error {
 	return nil
 }
 
-// runWorker 串行消费一个分片。同一业务键的顺序由 keyOrder 重排序缓冲在
-// 应用层保证，因此即使多个 worker 取到同键事件，也只会按 Seq 生效。
+// runWorker 消费一个分片，把每个事件路由到其业务键的串行协调协程。同键
+// 顺序由 keyCoordinator 保证；不同键的协调协程彼此并行。
 func (e *Engine) runWorker(idx int) {
 	defer e.wg.Done()
 	ch := e.queue.shardChan(idx)
 	for item := range ch {
-		e.handleItem(item)
-	}
-}
-
-// handleItem 执行“判序 -> 处理/暂缓 -> 推进后重投”的单事件生命周期。
-//
-// 暂缓的事件不会让本 worker 睡眠或占用线程：worker 立即回去消费下一个
-// 出队事件。指标的在途计数在事件被暂缓期间也保持计入，因此停机排空判定
-// 会把它们视为在途（它们随后会被重投或保留待重放）。
-func (e *Engine) handleItem(item queuedItem) {
-	it, res := e.admit(item)
-	if res == admitDeferred {
-		// 事件已挂起到该键暂缓堆：记为“暂缓中”，不计 worker 在途。等被
-		// release 重投后会再次进入 handleItem，届时正常计入在途。
-		return
-	}
-
-	e.metrics.incInFlight()
-	defer e.metrics.decInFlight()
-	outcome, perr := e.processWithRetry(it)
-	e.finalize(it, outcome, perr)
-
-	// 只要该键状态可能向前推进（应用成功或判重），就尝试释放暂缓事件。
-	if outcome == OutcomeApplied || outcome == OutcomeDuplicate {
-		e.release(it.ev.Key)
+		e.metrics.incInFlight()
+		// deliver 在该键 mailbox 满时会阻塞等待空位（或停机返回 false）。
+		// mailbox 容量按同键突发设计，正常不会长期阻塞；不同键不互相阻塞。
+		delivered := e.dispatch(item)
+		if !delivered {
+			// 停机导致未能交付：不 Ack，事件保留在 pending.log 中重放。
+			e.metrics.decInFlight()
+			continue
+		}
+		// 已交给协调协程：在途生命周期由事件完成（Ack）时通过 metrics 反映。
+		// 这里的在途计数在事件真正出队即计入，协调协程完成后通过队列深度与
+		// outstandingCount 共同判定排空。
+		e.metrics.decInFlight()
 	}
 }
 
@@ -309,13 +298,31 @@ func (e *Engine) sleepBackoff(n int) bool {
 	}
 }
 
+// handleContext 返回单个事件处理的上下文：同时受 HandleTimeout 与停机
+// 信号约束，停机时在途 Handler 立即收到取消，保证优雅停机可终止慢任务。
+func (e *Engine) handleContext() (context.Context, context.CancelFunc) {
+	ctx, cancelTimeout := context.WithTimeout(context.Background(), e.cfg.HandleTimeout)
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-e.finishCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, func() {
+		cancel()
+		cancelTimeout()
+	}
+}
+
 // processOnce 执行单次处理：在存储层原子地读-改-写。
 //
 // Handler 在业务键分片锁内被调用并施加 HandleTimeout；Handler 返回的
 // 任意错误都被归一化，不直接透出。
 func (e *Engine) processOnce(ev Event) (Outcome, *Error) {
 	const op = "engine.processOnce"
-	ctx, cancel := context.WithTimeout(context.Background(), e.cfg.HandleTimeout)
+	ctx, cancel := e.handleContext()
 	defer cancel()
 
 	_, verdict, aerr := e.store.Modify(ctx, ev, func(cur KeyState) (KeyState, error) {
@@ -365,20 +372,15 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 		_ = e.source.Close()
 	}
 
+	// 第一阶段：在保留 worker 与协调协程运行的前提下等待自然排空——队列中
+	// 无积压、所有业务键协调协程也没有未完成事件（mailbox + 缺口堆）。
 	drainCtx, cancelDrain := context.WithTimeout(ctx, e.cfg.ShutdownTimeout)
 	defer cancelDrain()
-
-	// 排空阶段：pump 持续把暂缓堆中序号已衔接的事件重投回队列；这里观察
-	// 队列深度与在途计数，二者归零即排空完成。尚缺口的事件无法在本次周期
-	// 内衔接，最终保留在 pending.log 中由下次启动重放。
-	ticker := time.NewTicker(2 * time.Millisecond)
+	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
 	drained := false
 	for {
-		e.requeueAllReady()
-		snap := e.metrics.Snapshot()
-		// 队列空、无 worker 在途、无暂缓事件，才算真正排空。
-		if e.queue.depth() == 0 && snap.InFlight == 0 && snap.Deferred == 0 {
+		if e.queue.depth() == 0 && e.outstandingCount() == 0 {
 			drained = true
 			break
 		}
@@ -386,15 +388,17 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 		case <-drainCtx.Done():
 			drained = false
 		case <-ticker.C:
-			continue
 		}
-		break
+		if drainCtx.Err() != nil {
+			break
+		}
 	}
-	e.sequencer.stopPump()
 
-	// 排空结束（或超时）：关闭分片通道。worker 会把 channel 中剩余事件
-	// 消费完（range 不丢消息）后退出。仍未给出最终结论的事件未 Ack，保留
-	// 在 pending.log，下次启动安全重放。
+	// 第二阶段：先通知所有业务键协调协程停机，解除它们在处理/退避/缺口上
+	// 的阻塞；未 Ack 事件保留在 pending.log 由下次启动重放。
+	e.stopCoordinators()
+	// 再关闭分片通道并等待 worker 退出。此时 deliver 若仍阻塞会因 stopCh
+	// 立即返回 false，worker 得以收尾。
 	e.queue.close()
 	e.wg.Wait()
 

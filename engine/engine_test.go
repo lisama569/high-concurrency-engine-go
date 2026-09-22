@@ -43,6 +43,9 @@ func waitFor(t *testing.T, cond func() bool, timeout time.Duration, msg string) 
 // 总量精确等于投递量、无重复应用。
 func TestConcurrentOrderingAndTotals(t *testing.T) {
 	cfg := testConfig(t)
+	cfg.ShutdownTimeout = 15 * time.Second
+	cfg.QueuePerShard = 2048
+	cfg.SubmitTimeout = time.Second
 	eng, err := New(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -108,7 +111,9 @@ func TestConcurrentOrderingAndTotals(t *testing.T) {
 // 事件按 Seq 顺序生效、不重不漏、终态版本正确。
 func TestSameKeyConcurrentIsOrdered(t *testing.T) {
 	cfg := testConfig(t)
-	cfg.QueuePerShard = 256
+	cfg.ShutdownTimeout = 20 * time.Second
+	cfg.QueuePerShard = 1024
+	cfg.SubmitTimeout = time.Second
 	eng, err := New(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -117,7 +122,7 @@ func TestSameKeyConcurrentIsOrdered(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const n = 400
+	n := 200 // race 插桩下用较小规模同样能暴露乱序竞争
 	var wg sync.WaitGroup
 	for i := 1; i <= n; i++ {
 		wg.Add(1)

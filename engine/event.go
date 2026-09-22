@@ -9,17 +9,17 @@ import (
 // Event 是引擎处理的最小事件单元。
 type Event struct {
 	// ID 事件的全局唯一标识，也是幂等去重键。
-	ID string
+	ID string `json:"id"`
 	// Key 业务键。同一业务键的事件必须串行、按序生效。
-	Key string
+	Key string `json:"key"`
 	// Seq 业务键内的单调递增序号（从 1 开始），用于顺序与冲突判定。
-	Seq int64
+	Seq int64 `json:"seq"`
 	// Kind 业务事件类型，由用户注册的 Handler 解释。
-	Kind string
+	Kind string `json:"kind"`
 	// Payload 事件负载（示例引擎中为可叠加的整数值）。
-	Payload int64
+	Payload int64 `json:"payload"`
 	// EnqueueAt 事件进入引擎的时间。
-	EnqueueAt time.Time
+	EnqueueAt time.Time `json:"enqueue_at,omitempty"`
 }
 
 // Outcome 是单个事件的处理结论。

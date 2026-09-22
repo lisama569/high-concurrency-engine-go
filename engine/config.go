@@ -14,6 +14,10 @@ type Config struct {
 	Workers int
 	// QueuePerShard 每个键分片有界队列的容量。
 	QueuePerShard int
+	// MailboxPerKey 每个业务键串行协调协程的 mailbox 容量。同键突发事件先
+	// 进入 mailbox；当某键处理能力不足导致其分片队列与 mailbox 都满时，
+	// Submit 在 SubmitTimeout 后以 KindQueueFull 明确拒绝（背压）。
+	MailboxPerKey int
 	// SubmitTimeout Submit 在队列满时愿意阻塞等待的最长时间；
 	// 超过后以 KindQueueFull 明确拒绝。0 表示不等待，立即拒绝。
 	SubmitTimeout time.Duration
@@ -38,6 +42,7 @@ func DefaultConfig() Config {
 		DataDir:         "data",
 		Workers:         runtime.NumCPU(),
 		QueuePerShard:   1024,
+		MailboxPerKey:   256,
 		SubmitTimeout:   50 * time.Millisecond,
 		HandleTimeout:   time.Second,
 		MaxAttempts:     3,
@@ -58,6 +63,9 @@ func (c *Config) Validate() error {
 	}
 	if c.QueuePerShard <= 0 {
 		c.QueuePerShard = def.QueuePerShard
+	}
+	if c.MailboxPerKey <= 0 {
+		c.MailboxPerKey = def.MailboxPerKey
 	}
 	if c.SubmitTimeout < 0 {
 		return newError(KindInvalid, "config.validate", "SubmitTimeout must be >= 0", nil)

@@ -5,6 +5,7 @@ import (
 	"hash/fnv"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // queuedItem 是内存有界队列中的一个条目。
@@ -15,23 +16,20 @@ type queuedItem struct {
 
 // shardedQueue 是按业务键哈希分片的有界内存队列。
 //
-// 每个分片是一条有界 channel，由固定 worker 串行消费，从而保证同一业务键
-// 的事件严格有序；不同键分布在不同分片上并行消费。队列满时 Submit 按
-// ctx 截止时间等待，超时即以 KindQueueFull 明确拒绝；停机期间则以
-// KindStopping 拒绝，两种背压原因可区分，事件不被静默丢弃。
+// 每个分片是一条有界 channel，由固定 worker 消费；不同键分布在不同分片上
+// 并行。队列满时 Submit 按 ctx 截止时间等待，超时以 KindQueueFull 明确拒
+// 绝，停机期间以 KindStopping 拒绝，两种背压原因可区分，事件不被静默丢弃。
 type shardedQueue struct {
 	shards   []chan queuedItem
 	mask     uint64
 	capPer   int
-	enqueued atomic.Int64 // 成功入队计数
+	enqueued atomic.Int64
 
 	stopOnce sync.Once
 	stopCh   chan struct{} // markStopping 时关闭
-	closeMu  sync.RWMutex
-	closed   bool // close() 后置位，发送前据此避免向已关闭通道写入
+	closed   atomic.Bool   // close() 置位，发送前快速失败
 }
 
-// nextPow2 返回 >= n 的最小 2 的幂。
 func nextPow2(n int) int {
 	if n < 1 {
 		return 1
@@ -43,8 +41,6 @@ func nextPow2(n int) int {
 	return p
 }
 
-// newShardedQueue 创建分片有界队列。shardCount 会向上取整为 2 的幂以用
-// 位运算取模；capacityPerShard 是每个分片的容量（背压阈值）。
 func newShardedQueue(shardCount, capacityPerShard int) *shardedQueue {
 	n := nextPow2(shardCount)
 	q := &shardedQueue{
@@ -59,66 +55,87 @@ func newShardedQueue(shardCount, capacityPerShard int) *shardedQueue {
 	return q
 }
 
-// markStopping 标记队列进入停机阶段并唤醒所有等待中的 Submit。
 func (q *shardedQueue) markStopping() {
 	q.stopOnce.Do(func() { close(q.stopCh) })
 }
 
-// shardOf 返回某个业务键所属的分片下标。
 func (q *shardedQueue) shardOf(key string) int {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(key))
 	return int(h.Sum64() & q.mask)
 }
 
-// Submit 将事件放入对应分片。
-//
-// 判定顺序：
-//  1. ctx 已取消 -> KindCanceled；
-//  2. 通道当前有空闲 -> 立即入队（停机后仍允许排空型入队，例如启动重放）；
-//  3. 否则等待空闲 / ctx 截止 / 停机信号；
-//     ctx 先到期 -> KindQueueFull（容量背压，原因可区分、可重试）；
-//     停机先发生 -> KindStopping（停机背压，事件已在持久日志中，安全重排）。
-func (q *shardedQueue) Submit(ctx context.Context, item queuedItem) *Error {
-	const op = "queue.submit"
-	ch := q.shards[q.shardOf(item.ev.Key)]
-
-	// 快路径：有空位直接入队。调用方即使已取消，事件也能可靠进入队列，
-	// 由引擎侧继续排空，符合“不静默丢弃”的要求。
+// safeSend 非阻塞发送。用原子标志做快速失败，并用 recover 兜底“检查标志
+// 后通道恰好被 close”的极端竞态，保证任何情况下都不会 panic。
+func (q *shardedQueue) safeSend(ch chan queuedItem, item queuedItem) (ok bool) {
+	if q.closed.Load() {
+		return false
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			ok = false
+		}
+	}()
 	select {
 	case ch <- item:
-		q.enqueued.Add(1)
-		return nil
+		return !q.closed.Load()
 	default:
+		return false
 	}
+}
 
-	// 慢路径：队列已满，背压必须有明确结论。
-	// 停机优先于超时：二者同时就绪时，事件被“安全重排”比“容量拒绝”更准确。
+// blockingSend 在队列已满时按截止时间阻塞等待空位。
+func (q *shardedQueue) blockingSend(ch chan queuedItem, item queuedItem, ctx context.Context) *Error {
+	const op = "queue.submit"
 	if q.isStopping() {
 		return newError(KindStopping, op,
 			"engine is shutting down; event retained in durable journal for replay", nil)
 	}
-	if ctx.Err() == context.DeadlineExceeded {
-		return newError(KindQueueFull, op,
-			"bounded queue full; submit timed out under backpressure", ctx.Err())
-	}
-	if err := ctx.Err(); err != nil {
-		return normalize(op, err)
-	}
-	select {
-	case ch <- item:
-		q.enqueued.Add(1)
-		return nil
-	case <-q.stopCh:
-		return newError(KindStopping, op,
-			"engine is shutting down; event retained in durable journal for replay", nil)
-	case <-ctx.Done():
+	ticker := time.NewTicker(200 * time.Microsecond)
+	defer ticker.Stop()
+	for {
+		if q.safeSend(ch, item) {
+			q.enqueued.Add(1)
+			return nil
+		}
+		if q.isStopping() {
+			return newError(KindStopping, op,
+				"engine is shutting down; event retained in durable journal for replay", nil)
+		}
 		if ctx.Err() == context.DeadlineExceeded {
 			return newError(KindQueueFull, op,
 				"bounded queue full; submit timed out under backpressure", ctx.Err())
 		}
-		return normalize(op, ctx.Err())
+		if err := ctx.Err(); err != nil {
+			return normalize(op, err)
+		}
+		select {
+		case <-q.stopCh:
+			return newError(KindStopping, op,
+				"engine is shutting down; event retained in durable journal for replay", nil)
+		case <-ctx.Done():
+			if ctx.Err() == context.DeadlineExceeded {
+				return newError(KindQueueFull, op,
+					"bounded queue full; submit timed out under backpressure", ctx.Err())
+			}
+			return normalize(op, ctx.Err())
+		case <-ticker.C:
+		}
 	}
+}
+
+// Submit 将事件放入对应分片；满则在 ctx 截止前等待，否则按原因拒绝。
+func (q *shardedQueue) Submit(ctx context.Context, item queuedItem) *Error {
+	if q.closed.Load() {
+		return newError(KindStopping, "queue.submit",
+			"queue already closed; event retained in durable journal for replay", nil)
+	}
+	ch := q.shards[q.shardOf(item.ev.Key)]
+	if q.safeSend(ch, item) {
+		q.enqueued.Add(1)
+		return nil
+	}
+	return q.blockingSend(ch, item, ctx)
 }
 
 // isStopping 判断队列是否已进入停机阶段。
@@ -131,32 +148,14 @@ func (q *shardedQueue) isStopping() bool {
 	}
 }
 
-// isClosed 判断分片通道是否已被关闭。
-func (q *shardedQueue) isClosed() bool {
-	q.closeMu.RLock()
-	defer q.closeMu.RUnlock()
-	return q.closed
-}
+func (q *shardedQueue) isClosed() bool { return q.closed.Load() }
 
-// trySend 非阻塞地向某分片发送；队列已关闭或当前已满时返回 false。
 func (q *shardedQueue) trySend(idx int, item queuedItem) bool {
-	q.closeMu.RLock()
-	defer q.closeMu.RUnlock()
-	if q.closed {
-		return false
-	}
-	select {
-	case q.shards[idx] <- item:
-		return true
-	default:
-		return false
-	}
+	return q.safeSend(q.shards[idx], item)
 }
 
-// shardChan 暴露指定分片的消费通道（供 worker 使用）。
 func (q *shardedQueue) shardChan(i int) <-chan queuedItem { return q.shards[i] }
 
-// depth 返回当前所有分片的积压总数（用于可观测指标）。
 func (q *shardedQueue) depth() int {
 	n := 0
 	for i := range q.shards {
@@ -165,18 +164,14 @@ func (q *shardedQueue) depth() int {
 	return n
 }
 
-// capacity 返回队列总容量。
 func (q *shardedQueue) capacity() int { return len(q.shards) * q.capPer }
 
-// close 关闭所有分片通道。调用方必须保证已没有阻塞型并发 Submit；
-// 非阻塞的 trySend 会通过 closed 标志安全失败。
+// close 关闭所有分片通道。safeSend 的原子标志 + recover 保证并发发送
+// 安全失败而不是 panic；排空期间的重投走 trySend，通道关闭后立即返回 false。
 func (q *shardedQueue) close() {
-	q.closeMu.Lock()
-	defer q.closeMu.Unlock()
-	if q.closed {
+	if q.closed.Swap(true) {
 		return
 	}
-	q.closed = true
 	for i := range q.shards {
 		close(q.shards[i])
 	}
