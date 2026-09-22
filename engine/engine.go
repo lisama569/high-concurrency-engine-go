@@ -30,6 +30,9 @@ type Engine struct {
 	sourceWG sync.WaitGroup
 	// sourceCancel 取消后台事件流。
 	sourceCancel context.CancelFunc
+
+	// sequencer 负责按业务键 Seq 的重排序与按序生效。
+	sequencer *sequencer
 }
 
 // New 按配置构造引擎；此时不创建任何文件。
@@ -73,7 +76,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	if e.store, err = openStoreWith(dir, e.cfg.SyncEachWrite); err != nil {
 		return err
 	}
-	if e.journal, err = openJournal(filepath.Join(dir, "pending.log")); err != nil {
+	if e.journal, err = openJournalWith(filepath.Join(dir, "pending.log"), e.cfg.SyncEachWrite); err != nil {
 		return err
 	}
 	if e.dlq, err = openDeadLetter(filepath.Join(dir, "dead-letter.log")); err != nil {
@@ -81,6 +84,8 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 	e.queue = newShardedQueue(e.cfg.Workers, e.cfg.QueuePerShard)
 	e.metrics = newMetrics(e.queue.capacity(), e.queue.depth)
+	e.sequencer = newSequencer()
+	e.sequencer.startPump(func() { e.requeueAllReady() })
 
 	// 启动 worker（与队列分片一一对应，保证同键串行）。
 	for i := 0; i < e.cfg.Workers; i++ {
@@ -189,67 +194,104 @@ func (e *Engine) Submit(ctx context.Context, ev Event) *Error {
 	return nil
 }
 
-// runWorker 串行消费一个分片，保证同一业务键事件有序生效。
+// runWorker 串行消费一个分片。同一业务键的顺序由 keyOrder 重排序缓冲在
+// 应用层保证，因此即使多个 worker 取到同键事件，也只会按 Seq 生效。
 func (e *Engine) runWorker(idx int) {
 	defer e.wg.Done()
 	ch := e.queue.shardChan(idx)
 	for item := range ch {
-		e.processWithRetry(item)
+		e.handleItem(item)
 	}
 }
 
-// processWithRetry 处理单个事件并执行有界退避重试。
-func (e *Engine) processWithRetry(item queuedItem) {
+// handleItem 执行“判序 -> 处理/暂缓 -> 推进后重投”的单事件生命周期。
+//
+// 暂缓的事件不会让本 worker 睡眠或占用线程：worker 立即回去消费下一个
+// 出队事件。指标的在途计数在事件被暂缓期间也保持计入，因此停机排空判定
+// 会把它们视为在途（它们随后会被重投或保留待重放）。
+func (e *Engine) handleItem(item queuedItem) {
+	it, res := e.admit(item)
+	if res == admitDeferred {
+		// 事件已挂起到该键暂缓堆：记为“暂缓中”，不计 worker 在途。等被
+		// release 重投后会再次进入 handleItem，届时正常计入在途。
+		return
+	}
+
+	e.metrics.incInFlight()
+	defer e.metrics.decInFlight()
+	outcome, perr := e.processWithRetry(it)
+	e.finalize(it, outcome, perr)
+
+	// 只要该键状态可能向前推进（应用成功或判重），就尝试释放暂缓事件。
+	if outcome == OutcomeApplied || outcome == OutcomeDuplicate {
+		e.release(it.ev.Key)
+	}
+}
+
+// finalize 落定单事件的最终结论：指标、Ack 与死信。
+//   - applied/duplicate/conflict：记录指标并 Ack；
+//   - failed 且因停机取消：不 Ack，保留待重放；
+//   - failed 且尝试耗尽：写死信（原因可区分）后 Ack，避免毒消息阻塞同键。
+func (e *Engine) finalize(item queuedItem, outcome Outcome, perr *Error) {
+	ev := item.ev
+	switch outcome {
+	case OutcomeApplied, OutcomeDuplicate, OutcomeConflict:
+		e.metrics.recordOutcome(outcome)
+		if aerr := e.journal.Ack(context.Background(), ev.ID); aerr != nil {
+			_ = aerr // 重启可能重放，存储层幂等保证结果不变
+		}
+		return
+	}
+	if perr != nil && perr.Kind == KindCanceled {
+		return // 安全重排：不 Ack、不写死信
+	}
+	e.metrics.recordOutcome(OutcomeFailed)
+	if perr == nil {
+		perr = newError(KindInternal, "engine.finalize", "event failed without error", nil)
+	}
+	if werr := e.dlq.Write(ev, perr); werr != nil {
+		return // 死信落盘失败：不 Ack，保留重放
+	}
+	_ = e.journal.Ack(context.Background(), ev.ID)
+}
+
+// processWithRetry 对一个已轮到序号的事件执行有界退避重试，返回最终结论。
+func (e *Engine) processWithRetry(item queuedItem) (Outcome, *Error) {
 	const op = "engine.process"
 	ev := item.ev
 	attempt := item.attempt
 
-	e.metrics.incInFlight()
-	defer e.metrics.decInFlight()
-
 	var lastErr *Error
-	terminal := false
-	for attempt <= e.cfg.MaxAttempts && !terminal {
+	for attempt <= e.cfg.MaxAttempts {
 		if attempt > item.attempt {
 			e.metrics.recordRetry()
 			if !e.sleepBackoff(attempt - 1) {
-				// 停机打断退避：不判失败、不写死信，事件保留在持久日志中，
-				// 随进程关闭被“安全重排”到下次启动重放。
-				return
+				// 停机打断退避：给出 canceled 结论；上层不 Ack，事件重放。
+				return OutcomeFailed, newError(KindCanceled, op,
+					"retry backoff interrupted by shutdown", nil)
 			}
 		}
 
 		outcome, perr := e.processOnce(ev)
 		switch outcome {
 		case OutcomeApplied, OutcomeDuplicate, OutcomeConflict:
-			// 这三类都已有确定结论（生效 / 幂等跳过 / 冲突标记），确认日志。
-			e.metrics.recordOutcome(outcome)
-			if aerr := e.journal.Ack(context.Background(), ev.ID); aerr != nil {
-				// Ack 失败意味着重启可能重放；存储层幂等保证结果不变。
-				_ = aerr
-			}
-			return
+			return outcome, nil
 		case OutcomeFailed:
 			lastErr = perr
 			if perr != nil && perr.Kind.Retryable() && attempt < e.cfg.MaxAttempts {
 				attempt++
 				continue
 			}
-			terminal = true
+			if lastErr == nil {
+				lastErr = newError(KindInternal, op, "event failed without explicit error", nil)
+			}
+			return OutcomeFailed, lastErr
 		}
 	}
-
-	// 所有尝试耗尽：写死信并 Ack（失败已被显式记录、原因可区分），
-	// 避免坏事件无限重放堵塞同键后续事件。
 	if lastErr == nil {
-		lastErr = newError(KindInternal, op, "event failed without explicit error", nil)
+		lastErr = newError(KindInternal, op, "retry budget exhausted without error", nil)
 	}
-	e.metrics.recordOutcome(OutcomeFailed)
-	if werr := e.dlq.Write(ev, lastErr); werr != nil {
-		// 死信写失败时不 Ack，保留在待处理日志中等待下次重启重放。
-		return
-	}
-	_ = e.journal.Ack(context.Background(), ev.ID)
+	return OutcomeFailed, lastErr
 }
 
 // sleepBackoff 在退避期间响应停机信号；返回 false 表示被停机打断。
@@ -324,37 +366,38 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 		_ = e.source.Close()
 	}
 
-	// 安全重排策略：关闭分片通道后，worker 会先把各自 channel 中已入队的
-	// 事件全部消费完（range 不丢消息），再退出。用 WaitGroup 在
-	// ShutdownTimeout 内等待；超时后仍在途的事件既未 Ack，也保留在
-	// pending.log 中，下次 Start 安全重放。
-	e.queue.close()
-	drained := true
-	done := make(chan struct{})
-	go func() {
-		e.wg.Wait()
-		close(done)
-	}()
 	drainCtx, cancelDrain := context.WithTimeout(ctx, e.cfg.ShutdownTimeout)
 	defer cancelDrain()
-	select {
-	case <-done:
-	case <-drainCtx.Done():
-		drained = false
-	}
-	if drained {
-		// 确保在途计数与队列积压视角也已归零（排空判定依据）。
+
+	// 排空阶段：pump 持续把暂缓堆中序号已衔接的事件重投回队列；这里观察
+	// 队列深度与在途计数，二者归零即排空完成。尚缺口的事件无法在本次周期
+	// 内衔接，最终保留在 pending.log 中由下次启动重放。
+	ticker := time.NewTicker(2 * time.Millisecond)
+	defer ticker.Stop()
+	drained := false
+	for {
+		e.requeueAllReady()
 		snap := e.metrics.Snapshot()
-		if snap.InFlight != 0 || e.queue.depth() != 0 {
-			drained = false
+		// 队列空、无 worker 在途、无暂缓事件，才算真正排空。
+		if e.queue.depth() == 0 && snap.InFlight == 0 && snap.Deferred == 0 {
+			drained = true
+			break
 		}
+		select {
+		case <-drainCtx.Done():
+			drained = false
+		case <-ticker.C:
+			continue
+		}
+		break
 	}
-	if !drained {
-		// 超时分支：worker 仍在运行时不能强行关闭文件句柄。此处等待它们
-		// 退出（单个事件受 HandleTimeout 上界约束，等待有界），未完成事件
-		// 不会被 Ack，随持久日志重放。
-		<-done
-	}
+	e.sequencer.stopPump()
+
+	// 排空结束（或超时）：关闭分片通道。worker 会把 channel 中剩余事件
+	// 消费完（range 不丢消息）后退出。仍未给出最终结论的事件未 Ack，保留
+	// 在 pending.log，下次启动安全重放。
+	e.queue.close()
+	e.wg.Wait()
 
 	var firstErr error
 	if e.dlq != nil {

@@ -27,6 +27,8 @@ type shardedQueue struct {
 
 	stopOnce sync.Once
 	stopCh   chan struct{} // markStopping 时关闭
+	closeMu  sync.RWMutex
+	closed   bool // close() 后置位，发送前据此避免向已关闭通道写入
 }
 
 // nextPow2 返回 >= n 的最小 2 的幂。
@@ -129,6 +131,28 @@ func (q *shardedQueue) isStopping() bool {
 	}
 }
 
+// isClosed 判断分片通道是否已被关闭。
+func (q *shardedQueue) isClosed() bool {
+	q.closeMu.RLock()
+	defer q.closeMu.RUnlock()
+	return q.closed
+}
+
+// trySend 非阻塞地向某分片发送；队列已关闭或当前已满时返回 false。
+func (q *shardedQueue) trySend(idx int, item queuedItem) bool {
+	q.closeMu.RLock()
+	defer q.closeMu.RUnlock()
+	if q.closed {
+		return false
+	}
+	select {
+	case q.shards[idx] <- item:
+		return true
+	default:
+		return false
+	}
+}
+
 // shardChan 暴露指定分片的消费通道（供 worker 使用）。
 func (q *shardedQueue) shardChan(i int) <-chan queuedItem { return q.shards[i] }
 
@@ -144,8 +168,15 @@ func (q *shardedQueue) depth() int {
 // capacity 返回队列总容量。
 func (q *shardedQueue) capacity() int { return len(q.shards) * q.capPer }
 
-// close 关闭所有分片通道。调用方必须保证已没有并发 Submit。
+// close 关闭所有分片通道。调用方必须保证已没有阻塞型并发 Submit；
+// 非阻塞的 trySend 会通过 closed 标志安全失败。
 func (q *shardedQueue) close() {
+	q.closeMu.Lock()
+	defer q.closeMu.Unlock()
+	if q.closed {
+		return
+	}
+	q.closed = true
 	for i := range q.shards {
 		close(q.shards[i])
 	}

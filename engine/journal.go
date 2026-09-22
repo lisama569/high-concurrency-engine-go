@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // Journal 是“待处理事件日志”（持久化有界队列的落盘部分）。
@@ -43,17 +44,35 @@ type journalLine struct {
 }
 
 type fileJournal struct {
-	mu      sync.Mutex
-	path    string
-	f       *os.File
-	w       *bufio.Writer
-	pending map[string]Event // id -> 事件，同时保留首次出现顺序于 order
-	order   []string
-	closed  bool
+	mu       sync.Mutex
+	path     string
+	f        *os.File
+	w        *bufio.Writer
+	pending  map[string]Event // id -> 事件，同时保留首次出现顺序于 order
+	order    []string
+	closed   bool
+	syncEach bool
+
+	// 组提交：dirty 表示缓冲有未落盘字节；commit 协程按固定节拍一次
+	// flush+fsync 覆盖这一节拍内的所有 add/ack。
+	commitStop chan struct{}
+	commitDone chan struct{}
+	dirtyMu    sync.Mutex
+	dirty      bool
 }
 
-// openJournal 打开/创建待处理日志并重放已有内容到内存索引。
+// journalCommitInterval 是组提交刷盘节拍。
+const journalCommitInterval = 2 * 1000 * 1000 // 2ms（纳秒）
+
+// openJournal 以每行 fsync 的强持久化级别打开待处理日志。
 func openJournal(path string) (Journal, error) {
+	return openJournalWith(path, true)
+}
+
+// openJournalWith 打开待处理日志。syncEach=false 时采用组提交（后台节拍
+// 刷盘），吞吐显著提高；进程崩溃可能丢失最近一个节拍内的待处理记录，但
+// 这些事件通常仍停留在事件源 offset 之前，重启会重新投递（幂等兜底）。
+func openJournalWith(path string, syncEach bool) (Journal, error) {
 	const op = "journal.open"
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, newError(KindStorage, op, "mkdir: "+err.Error(), err)
@@ -63,10 +82,13 @@ func openJournal(path string) (Journal, error) {
 		return nil, newError(KindStorage, op, "open: "+err.Error(), err)
 	}
 	j := &fileJournal{
-		path:    path,
-		f:       f,
-		w:       bufio.NewWriter(f),
-		pending: make(map[string]Event),
+		path:       path,
+		f:          f,
+		w:          bufio.NewWriterSize(f, 64*1024),
+		pending:    make(map[string]Event),
+		syncEach:   syncEach,
+		commitStop: make(chan struct{}),
+		commitDone: make(chan struct{}),
 	}
 	if err := j.load(); err != nil {
 		return nil, err
@@ -75,7 +97,37 @@ func openJournal(path string) (Journal, error) {
 	if _, err := f.Seek(0, io.SeekEnd); err != nil {
 		return nil, newError(KindStorage, op, "seek end: "+err.Error(), err)
 	}
+	if !syncEach {
+		go j.runCommit()
+	}
 	return j, nil
+}
+
+// runCommit 周期性把脏缓冲 flush+fsync（组提交）。
+func (j *fileJournal) runCommit() {
+	defer close(j.commitDone)
+	t := time.NewTicker(time.Duration(journalCommitInterval))
+	defer t.Stop()
+	for {
+		select {
+		case <-j.commitStop:
+			return
+		case <-t.C:
+			j.dirtyMu.Lock()
+			dirty := j.dirty
+			j.dirtyMu.Unlock()
+			if !dirty {
+				continue
+			}
+			j.mu.Lock()
+			_ = j.w.Flush()
+			_ = j.f.Sync()
+			j.mu.Unlock()
+			j.dirtyMu.Lock()
+			j.dirty = false
+			j.dirtyMu.Unlock()
+		}
+	}
 }
 
 func (j *fileJournal) load() error {
@@ -122,7 +174,9 @@ func (j *fileJournal) load() error {
 	return nil
 }
 
-func (j *fileJournal) writeLine(l journalLine) error {
+// writeLineLocked 在已持有 j.mu 时写入一行；按持久化级别决定是否立即
+// flush+fsync，否则只标记脏，由 runCommit 组提交。
+func (j *fileJournal) writeLineLocked(l journalLine) error {
 	const op = "journal.write"
 	data, err := json.Marshal(&l)
 	if err != nil {
@@ -134,12 +188,19 @@ func (j *fileJournal) writeLine(l journalLine) error {
 	if err := j.w.WriteByte('\n'); err != nil {
 		return newError(KindStorage, op, "write: "+err.Error(), err)
 	}
-	if err := j.w.Flush(); err != nil {
-		return newError(KindStorage, op, "flush: "+err.Error(), err)
+	if j.syncEach {
+		if err := j.w.Flush(); err != nil {
+			return newError(KindStorage, op, "flush: "+err.Error(), err)
+		}
+		if err := j.f.Sync(); err != nil {
+			return newError(KindStorage, op, "sync: "+err.Error(), err)
+		}
+		return nil
 	}
-	if err := j.f.Sync(); err != nil {
-		return newError(KindStorage, op, "sync: "+err.Error(), err)
-	}
+	// 组提交：标记脏即可，节拍协程负责落盘。
+	j.dirtyMu.Lock()
+	j.dirty = true
+	j.dirtyMu.Unlock()
 	return nil
 }
 
@@ -153,7 +214,7 @@ func (j *fileJournal) Append(ctx context.Context, ev Event) error {
 	if j.closed {
 		return newError(KindStorage, op, "journal closed", nil)
 	}
-	if err := j.writeLine(journalLine{Type: "add", Event: &ev}); err != nil {
+	if err := j.writeLineLocked(journalLine{Type: "add", Event: &ev}); err != nil {
 		return err
 	}
 	if _, ok := j.pending[ev.ID]; !ok {
@@ -173,7 +234,7 @@ func (j *fileJournal) Ack(ctx context.Context, eventID string) error {
 	if j.closed {
 		return newError(KindStorage, op, "journal closed", nil)
 	}
-	if err := j.writeLine(journalLine{Type: "ack", ID: eventID}); err != nil {
+	if err := j.writeLineLocked(journalLine{Type: "ack", ID: eventID}); err != nil {
 		return err
 	}
 	delete(j.pending, eventID)
@@ -248,6 +309,12 @@ func (j *fileJournal) compactLocked() error {
 }
 
 func (j *fileJournal) Close() error {
+	// 组提交模式：先停止节拍协程，并把残留缓冲强制落盘，保证优雅停机不
+	// 丢最近一个节拍内的 add/ack。
+	if !j.syncEach {
+		close(j.commitStop)
+		<-j.commitDone
+	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.closed {
@@ -255,7 +322,13 @@ func (j *fileJournal) Close() error {
 	}
 	j.closed = true
 	var firstErr error
-	if err := j.compactLocked(); err != nil {
+	if err := j.w.Flush(); err != nil && firstErr == nil {
+		firstErr = newError(KindStorage, "journal.close", "flush: "+err.Error(), err)
+	}
+	if err := j.f.Sync(); err != nil && firstErr == nil {
+		firstErr = newError(KindStorage, "journal.close", "sync: "+err.Error(), err)
+	}
+	if err := j.compactLocked(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	// 压缩已用新文件替换旧文件，旧句柄直接关闭即可。

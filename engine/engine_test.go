@@ -49,6 +49,13 @@ func TestConcurrentOrderingAndTotals(t *testing.T) {
 
 	const goroutines = 16
 	const perKey = 150
+	// 独占键事件天然按序号单调投递（无缺口、无暂缓），给足队列容量避免
+	// 容量背压干扰“不重不漏”判定；背压拒绝由专门用例覆盖。
+	savedCap := cfg.QueuePerShard
+	savedTimeout := cfg.SubmitTimeout
+	cfg.QueuePerShard = 1024
+	cfg.SubmitTimeout = 200 * time.Millisecond
+	defer func() { cfg.QueuePerShard = savedCap; cfg.SubmitTimeout = savedTimeout }()
 	var wg sync.WaitGroup
 	for g := 0; g < goroutines; g++ {
 		wg.Add(1)
