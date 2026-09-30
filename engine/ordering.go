@@ -218,23 +218,35 @@ func (e *Engine) dispatch(item queuedItem) bool {
 	return k.deliver(item)
 }
 
-// outstandingCount 返回所有键 mailbox、缺口堆与处理中事件的总数。
-func (e *Engine) outstandingCount() int {
+// coordinatorBacklogs 返回每个业务键在协调器侧（mailbox + 缺口堆 + 处理
+// 中）的未结论事件数。
+func (e *Engine) coordinatorBacklogs() map[string]int {
 	e.sequencer.mu.Lock()
 	ks := make([]*keyCoordinator, 0, len(e.sequencer.keys))
 	for _, k := range e.sequencer.keys {
 		ks = append(ks, k)
 	}
 	e.sequencer.mu.Unlock()
-	n := 0
+	out := make(map[string]int, len(ks))
 	for _, k := range ks {
 		k.mu.Lock()
-		n += k.waitHeap.Len()
-		n += len(k.mailbox)
+		n := k.waitHeap.Len() + len(k.mailbox)
 		if k.busy {
 			n++
 		}
 		k.mu.Unlock()
+		if n > 0 {
+			out[k.key] = n
+		}
+	}
+	return out
+}
+
+// outstandingCount 返回所有键 mailbox、缺口堆与处理中事件的总数。
+func (e *Engine) outstandingCount() int {
+	n := 0
+	for _, c := range e.coordinatorBacklogs() {
+		n += c
 	}
 	return n
 }

@@ -36,6 +36,9 @@ type Engine struct {
 	sequencer *sequencer
 	// inflightSem 限制系统中“已接收待结论”的事件总数，构成处理侧背压。
 	inflightSem *countingSem
+	// inflightSemCap 为 0 时按默认公式（队列容量 + worker×mailbox）设定；
+	// 非 0 时使用该覆盖值（仅供测试构造确定性背压，生产路径不设置）。
+	inflightSemCap int
 }
 
 // New 按配置构造引擎；此时不创建任何文件。
@@ -87,11 +90,21 @@ func (e *Engine) Start(ctx context.Context) error {
 		return err
 	}
 	e.queue = newShardedQueue(e.cfg.Workers, e.cfg.QueuePerShard)
-	e.metrics = newMetrics(e.queue.capacity(), e.queue.depth)
 	e.sequencer = newSequencer()
+	e.metrics = newMetrics(
+		e.queue.capacity(),
+		e.cfg.HotKeyBacklogThreshold,
+		e.queue.depth,
+		e.queue.depthByPriority,
+		e.keyBacklogs,
+	)
 	// 在途上限 = 队列总容量 + 每键 mailbox 总量上界，给处理侧留足缓冲，
 	// 超出后事件停留在有界队列并按 SubmitTimeout 触发容量背压。
-	e.inflightSem = newCountingSem(e.queue.capacity() + e.cfg.Workers*e.cfg.MailboxPerKey)
+	semCap := e.queue.capacity() + e.cfg.Workers*e.cfg.MailboxPerKey
+	if e.inflightSemCap > 0 {
+		semCap = e.inflightSemCap
+	}
+	e.inflightSem = newCountingSem(semCap)
 
 	// 启动 worker（与队列分片一一对应，保证同键串行）。
 	for i := 0; i < e.cfg.Workers; i++ {
@@ -163,12 +176,15 @@ func (e *Engine) submitCtx(parent context.Context) (context.Context, context.Can
 //   - KindStorage   持久日志写入失败（事件未入队，无重复风险）。
 func (e *Engine) Submit(ctx context.Context, ev Event) *Error {
 	const op = "engine.submit"
-	e.metrics.recordReceived()
+	e.metrics.recordReceived(ev.Priority)
 
 	if err := ev.validate(); err != nil {
-		e.metrics.recordRejected(KindInvalid)
+		e.metrics.recordRejected(ev.Priority, KindInvalid)
 		return normalize(op, err)
 	}
+	// 优先级只影响不同业务键之间的消费先后；同键事件仍按 Seq 生效，故在
+	// 入口归一化并随事件一起持久化，重启重放语义不变。
+	ev.Priority = normalizePriority(ev.Priority)
 	if ev.EnqueueAt.IsZero() {
 		ev.EnqueueAt = time.Now()
 	}
@@ -177,40 +193,45 @@ func (e *Engine) Submit(ctx context.Context, ev Event) *Error {
 	stopping := e.stopped
 	e.mu.Unlock()
 	if stopping {
-		e.metrics.recordRejected(KindStopping)
+		e.metrics.recordRejected(ev.Priority, KindStopping)
 		return newError(KindStopping, op,
 			"engine is shutting down; reject new event "+ev.ID, nil)
 	}
 
 	// 先落盘待处理日志，再入内存队列，保证任何拒绝/崩溃后事件仍可重放。
 	if err := e.journal.Append(ctx, ev); err != nil {
-		e.metrics.recordRejected(KindStorage)
+		e.metrics.recordRejected(ev.Priority, KindStorage)
 		return normalize(op, err)
 	}
 
 	qctx, cancel := e.submitCtx(ctx)
 	defer cancel()
 	if perr := e.queue.Submit(qctx, queuedItem{ev: ev, attempt: 1}); perr != nil {
-		// 入队失败（背压/停机）：事件已在持久日志里，拒绝原因可区分，
-		// 不会丢失；调用方可按 Retryable 决定稍后重投或依赖重启重放。
-		e.metrics.recordRejected(perr.Kind)
+		// 入队失败（背压/拥塞限流/停机）：事件已在持久日志里，拒绝原因可
+		// 区分，不会丢失；调用方可按 Retryable 决定稍后重投或依赖重启重放。
+		e.metrics.recordRejected(ev.Priority, perr.Kind)
 		return perr
 	}
-	e.metrics.recordAccepted()
+	e.metrics.recordAccepted(ev.Priority)
 	return nil
 }
 
 // runWorker 消费一个分片，把每个事件路由到其业务键的串行协调协程。
 //
+// 分片队列按“高优先级优先、同级键间轮转”的公平顺序弹出事件。
 // dispatch 可能因为：
 //   - 目标键 mailbox 满（该键处理能力不足）：不能静默丢弃，把事件退回分片
-//     队列稍后重试；队列也满则短退避后重试，直到停机（事件始终在队列或
-//     mailbox 中，且持久日志兜底，绝不丢失）；
+//     队列中该键的 FIFO 尾部，稍后参与轮转重试，并让出时间片给目标键协调
+//     协程追赶；直到停机（事件始终在队列或 mailbox 中，且持久日志兜底，
+//     绝不丢失）；
 //   - 停机 finishCh 关闭：放弃重试，事件未 Ack，保留在 pending.log 重放。
 func (e *Engine) runWorker(idx int) {
 	defer e.wg.Done()
-	ch := e.queue.shardChan(idx)
-	for item := range ch {
+	for {
+		item, ok := e.queue.pop(idx)
+		if !ok {
+			return // 队列已关闭且排空完毕
+		}
 		for {
 			if e.dispatch(item) {
 				break
@@ -218,11 +239,10 @@ func (e *Engine) runWorker(idx int) {
 			if e.isFinish() {
 				break // 停机：不 Ack，事件随日志重放
 			}
-			// mailbox 背压：退回队列重试。非阻塞放回（当前就是从该通道取
-			// 出，必有空位），再让出时间片给目标键协调协程追赶。
-			if !e.queue.trySend(idx, item) {
-				time.Sleep(200 * time.Microsecond)
-			}
+			// mailbox 背压：退回该键 FIFO 尾部参与公平轮转，再让出时间片
+			// 给目标键协调协程追赶。
+			e.queue.requeue(idx, item)
+			time.Sleep(200 * time.Microsecond)
 		}
 	}
 }
@@ -449,10 +469,42 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 	return firstErr
 }
 
+// keyBacklogs 聚合每个业务键“已接收未结论”事件的分布：仍在分片调度队列
+// 中的（Queue）与已进入该键协调器的（Outstanding）。两个数据源分别在
+// 各自锁下取近似一致快照，瞬间的跨源计数偏差只影响观测、不影响正确性。
+func (e *Engine) keyBacklogs() map[string]KeyBacklog {
+	if e.queue == nil || e.sequencer == nil {
+		return map[string]KeyBacklog{}
+	}
+	out := make(map[string]KeyBacklog)
+	for k, n := range e.queue.backlogByKey() {
+		b := out[k]
+		b.Queue = n
+		out[k] = b
+	}
+	for k, n := range e.coordinatorBacklogs() {
+		b := out[k]
+		b.Outstanding = n
+		out[k] = b
+	}
+	for k, b := range out {
+		b.Total = b.Queue + b.Outstanding
+		out[k] = b
+	}
+	return out
+}
+
 // Metrics 返回当前可观测指标快照。
 func (e *Engine) Metrics() MetricsSnapshot {
 	if e.metrics == nil {
-		return MetricsSnapshot{RejectReason: map[string]int64{}}
+		return MetricsSnapshot{
+			RejectReason:       map[string]int64{},
+			ReceivedByPriority: map[string]int64{},
+			AcceptedByPriority: map[string]int64{},
+			RejectedByPriority: map[string]int64{},
+			KeyBacklog:         map[string]KeyBacklog{},
+			HotKeys:            map[string]int{},
+		}
 	}
 	return e.metrics.Snapshot()
 }

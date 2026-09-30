@@ -24,6 +24,10 @@ const (
 	KindCanceled
 	// KindQueueFull 有界队列已满，事件被拒绝（背压）。
 	KindQueueFull
+	// KindPriorityThrottled 低优先级事件在队列拥塞（容量被高优先级事件
+	// 占住）时被拒绝。与 KindQueueFull 区分：此时并非“任何事件都进不来”，
+	// 高优先级事件仍可被接收。可稍后重试。
+	KindPriorityThrottled
 	// KindStopping 引擎正在停机，不再接收新事件（背压）。
 	KindStopping
 	// KindConflict 业务键状态版本冲突，事件被显式标记而非静默覆盖。
@@ -39,31 +43,33 @@ const (
 )
 
 var kindNames = map[ErrorKind]string{
-	KindUnknown:   "unknown",
-	KindTimeout:   "timeout",
-	KindCanceled:  "canceled",
-	KindQueueFull: "queue_full",
-	KindStopping:  "stopping",
-	KindConflict:  "conflict",
-	KindDuplicate: "duplicate",
-	KindStorage:   "storage",
-	KindInvalid:   "invalid",
-	KindInternal:  "internal",
+	KindUnknown:           "unknown",
+	KindTimeout:           "timeout",
+	KindCanceled:          "canceled",
+	KindQueueFull:         "queue_full",
+	KindPriorityThrottled: "priority_throttled",
+	KindStopping:          "stopping",
+	KindConflict:          "conflict",
+	KindDuplicate:         "duplicate",
+	KindStorage:           "storage",
+	KindInvalid:           "invalid",
+	KindInternal:          "internal",
 }
 
 // 各类错误的默认可重试性：背压拒绝与停机拒绝可稍后重投；取消/冲突/重复/
 // 非法输入重试无意义；超时与存储故障可重试。
 var kindRetryables = map[ErrorKind]bool{
-	KindUnknown:   false,
-	KindTimeout:   true,
-	KindCanceled:  false,
-	KindQueueFull: true,
-	KindStopping:  true,
-	KindConflict:  false,
-	KindDuplicate: false,
-	KindStorage:   true,
-	KindInvalid:   false,
-	KindInternal:  false,
+	KindUnknown:           false,
+	KindTimeout:           true,
+	KindCanceled:          false,
+	KindQueueFull:         true,
+	KindPriorityThrottled: true,
+	KindStopping:          true,
+	KindConflict:          false,
+	KindDuplicate:         false,
+	KindStorage:           true,
+	KindInvalid:           false,
+	KindInternal:          false,
 }
 
 // String 返回错误类别的可读名称。

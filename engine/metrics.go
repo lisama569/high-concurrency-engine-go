@@ -6,6 +6,18 @@ import (
 	"time"
 )
 
+// KeyBacklog 是单个业务键在引擎内部的积压明细。
+type KeyBacklog struct {
+	// Queue 仍停留在分片调度队列中的该键事件数。
+	Queue int
+	// Outstanding 已进入该键协调器（mailbox + 缺口堆 + 处理中）的事件数。
+	Outstanding int
+	// Total = Queue + Outstanding，是该键“已接收未结论”的总数。
+	Total int
+	// Hot 表示该键是否达到热点键积压阈值。
+	Hot bool
+}
+
 // MetricsSnapshot 是某一时刻引擎可观测指标的快照。
 type MetricsSnapshot struct {
 	Received   int64 // 进入引擎的事件总数
@@ -22,6 +34,22 @@ type MetricsSnapshot struct {
 	// RejectReason 按归一化错误类别统计的拒绝原因，例如 queue_full/stopping。
 	RejectReason map[string]int64
 	StartTime    time.Time
+
+	// 按优先级分类的接收/接收成功/拒绝计数，键为 Priority.String()
+	// （"high" / "normal"）。
+	ReceivedByPriority map[string]int64
+	AcceptedByPriority map[string]int64
+	RejectedByPriority map[string]int64
+	// QueueHigh / QueueNormal 当前队列中按优先级分类的积压。
+	QueueHigh   int
+	QueueNormal int
+	// KeyBacklog 每个业务键的当前积压（含队列与协调器两侧）。
+	KeyBacklog map[string]KeyBacklog
+	// HotKeys 积压达到 HotKeyBacklogThreshold 的业务键及其积压量（无序，
+	// 仅列出热点）；为空表示当前没有识别出热点键。
+	HotKeys map[string]int
+	// HotKeyThreshold 热点键判定阈值。
+	HotKeyThreshold int
 }
 
 // Metrics 以并发安全的方式记录吞吐与积压指标。
@@ -36,30 +64,57 @@ type Metrics struct {
 	failed     atomic.Int64
 	retried    atomic.Int64
 
+	// 按优先级分类的接收/接收成功/拒绝（下标为归一化后的 Priority）。
+	receivedPri [2]atomic.Int64
+	acceptedPri [2]atomic.Int64
+	rejectedPri [2]atomic.Int64
+
 	mu            sync.Mutex
 	rejectReason  map[string]int64
 	queueDepth    func() int
+	queueDepthPri func() (high, normal int)
+	keyBacklogFn  func() map[string]KeyBacklog
 	queueCapacity int
+	hotKeyThresh  int
 	startTime     time.Time
 }
 
-// newMetrics 创建指标记录器。depthFn 用于实时读取队列积压。
-func newMetrics(queueCapacity int, depthFn func() int) *Metrics {
+// newMetrics 创建指标记录器。
+//   - depthFn 实时读取队列积压总量；
+//   - depthPriFn 实时读取按优先级分类的队列积压；
+//   - keyBacklogFn 实时读取按业务键聚合的积压（队列 + 协调器）；
+//   - hotKeyThreshold 为热点键判定阈值。
+func newMetrics(queueCapacity int, hotKeyThreshold int,
+	depthFn func() int,
+	depthPriFn func() (high, normal int),
+	keyBacklogFn func() map[string]KeyBacklog,
+) *Metrics {
 	return &Metrics{
 		rejectReason:  make(map[string]int64),
 		queueDepth:    depthFn,
+		queueDepthPri: depthPriFn,
+		keyBacklogFn:  keyBacklogFn,
 		queueCapacity: queueCapacity,
+		hotKeyThresh:  hotKeyThreshold,
 		startTime:     time.Now(),
 	}
 }
 
-func (m *Metrics) recordReceived() { m.received.Add(1) }
+func (m *Metrics) recordReceived(p Priority) {
+	m.received.Add(1)
+	m.receivedPri[normalizePriority(p)].Add(1)
+}
 
-func (m *Metrics) recordAccepted() { m.accepted.Add(1) }
+func (m *Metrics) recordAccepted(p Priority) {
+	m.accepted.Add(1)
+	m.acceptedPri[normalizePriority(p)].Add(1)
+}
 
-// recordRejected 按归一化错误类别记录一次拒绝，保证“被拒绝原因可区分”。
-func (m *Metrics) recordRejected(kind ErrorKind) {
+// recordRejected 按归一化错误类别记录一次拒绝，保证“被拒绝原因可区分”，
+// 同时按事件优先级维度计数。
+func (m *Metrics) recordRejected(p Priority, kind ErrorKind) {
 	m.rejected.Add(1)
+	m.rejectedPri[normalizePriority(p)].Add(1)
 	m.mu.Lock()
 	m.rejectReason[kind.String()]++
 	m.mu.Unlock()
@@ -90,12 +145,45 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 	for k, v := range m.rejectReason {
 		reasons[k] = v
 	}
+	hotThreshold := m.hotKeyThresh
 	m.mu.Unlock()
 
 	depth, capTotal := 0, m.queueCapacity
+	high, normal := 0, 0
 	if m.queueDepth != nil {
 		depth = m.queueDepth()
 	}
+	if m.queueDepthPri != nil {
+		high, normal = m.queueDepthPri()
+	}
+
+	keyBacklogs := map[string]KeyBacklog{}
+	hotKeys := map[string]int{}
+	if m.keyBacklogFn != nil {
+		for k, b := range m.keyBacklogFn() {
+			keyBacklogs[k] = b
+			if b.Total >= hotThreshold {
+				b.Hot = true
+				keyBacklogs[k] = b
+				hotKeys[k] = b.Total
+			}
+		}
+	}
+
+	priNames := [2]string{PriorityNormal.String(), PriorityHigh.String()}
+	recvByPri := map[string]int64{
+		priNames[PriorityNormal]: m.receivedPri[PriorityNormal].Load(),
+		priNames[PriorityHigh]:   m.receivedPri[PriorityHigh].Load(),
+	}
+	accByPri := map[string]int64{
+		priNames[PriorityNormal]: m.acceptedPri[PriorityNormal].Load(),
+		priNames[PriorityHigh]:   m.acceptedPri[PriorityHigh].Load(),
+	}
+	rejByPri := map[string]int64{
+		priNames[PriorityNormal]: m.rejectedPri[PriorityNormal].Load(),
+		priNames[PriorityHigh]:   m.rejectedPri[PriorityHigh].Load(),
+	}
+
 	return MetricsSnapshot{
 		Received:     m.received.Load(),
 		Accepted:     m.accepted.Load(),
@@ -110,5 +198,14 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		QueueMax:     capTotal,
 		RejectReason: reasons,
 		StartTime:    m.startTime,
+
+		ReceivedByPriority: recvByPri,
+		AcceptedByPriority: accByPri,
+		RejectedByPriority: rejByPri,
+		QueueHigh:          high,
+		QueueNormal:        normal,
+		KeyBacklog:         keyBacklogs,
+		HotKeys:            hotKeys,
+		HotKeyThreshold:    hotThreshold,
 	}
 }

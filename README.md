@@ -13,10 +13,10 @@
 ## 1. 并发模型
 
 ```
-              有界分片队列                  每业务键串行协调器
- 事件来源 ──► shard0 chan ──► worker0 ──► keyCoordinator(actor) ──► 状态存储
-(文件+offset) shard1 chan ──► worker1 ──► keyCoordinator(actor)
-   │          ...                    ▲
+              有界分片公平队列                每业务键串行协调器
+ 事件来源 ──► 高优先级层 ──► worker0 ──► keyCoordinator(actor) ──► 状态存储
+(文件+offset) 普通优先级层    worker1 ──► keyCoordinator(actor)
+   │       (同级各键轮转 RR)        ▲
    └─ Submit() 先写 pending.log 再入队 ┘
 ```
 
@@ -35,16 +35,50 @@
 - **在途信号量**：限制“已接收但尚未有最终结论”的事件总量。处理能力不足
   时，事件在有界队列排队；超出 `SubmitTimeout` 即触发明确背压。
 
+## 1.1 优先级与公平调度（新增能力）
+
+在原有“按业务键分片 + 每键串行 actor”之上，分片队列升级为**两级优先级 +
+键间轮转（round-robin）**的公平调度器：
+
+- **事件优先级**：`Event.Priority` 取 `PriorityHigh(1)` 或缺省的
+  `PriorityNormal(0)`。
+  - **拥塞时高优先级先消费**：只要某分片里还压着高优先级事件，普通优先级
+    事件就整体等待，绝不越过高优先级被服务；
+  - **只影响不同键之间的先后**：同一业务键的事件仍全部进入该键唯一协调
+    协程，由它严格按 `Seq` 排序生效。同一个键先后投递的事件，无论携带
+    什么优先级，最终生效顺序都与投递（`Seq`）顺序一致，幂等语义不变；
+  - 优先级随事件持久化进 `pending.log` / `events.log`，停机重启后规则
+    不变（重放事件仍带原优先级）。
+- **按业务键公平轮转**：同一优先级内，调度器为每个非空业务键维护一个
+  轮转环，**每次只从队头键取一个事件，随后把该键转到环尾**。因此单个热点
+  键即使涌入海量事件，也只能与其它键**交替推进**，无法长期霸占某个 worker
+  的消费能力；冷键事件在热点键只处理了少量积压时就能得到调度。
+- **热点键识别**：某个业务键“队列中 + 协调器中（mailbox/缺口堆/处理中）”
+  的未结论事件总数达到 `HotKeyBacklogThreshold` 时，会被列入指标快照的
+  `HotKeys`，不再无声无息地拖慢全局。
+
+> 边界说明：优先级是**严格优先**而非加权比例。高优先级持续满载时，普通
+> 优先级会被推迟（并按下面的限流语义被显式拒绝），这是有意设计——高优先
+> 级代表更紧急的工作；公平性保证作用在**同一优先级内部的各业务键之间**。
+
 ## 2. 背压与可观测性
 
 - 处理能力不足时，事件**不会被静默丢弃**。`Submit` 在截止时间内拿不到队列
   空位会返回带明确类别的归一化错误：
-  - `queue_full`：容量背压，等待超时（**可重试**）；
+  - `queue_full`：容量背压，等待超时（**可重试**），表示连高优先级也进
+    不来的“真正容量耗尽”；
+  - `priority_throttled`：**新增**。队列满且被高优先级事件占住时，普通
+    优先级事件**立即**（不消耗 `SubmitTimeout`）被拒绝，原因与真正的容量
+    耗尽区分开，同样**可重试**；高优先级事件不受此限流，仍会排队等待空位；
   - `stopping`：引擎停机中，事件已在持久日志里（安全重排）；
   - 以及 `invalid` / `storage` / `canceled` / `timeout`。
-- `MetricsSnapshot` 暴露吞吐与积压：`received/accepted/rejected/applied/
-  duplicates/conflicts/failed/retried`，以及 `QueueDepth/QueueMax` 和按
-  原因分类的 `RejectReason`。
+- `MetricsSnapshot` 在原有吞吐/积压基础上新增：
+  - `ReceivedByPriority / AcceptedByPriority / RejectedByPriority`：按
+    优先级（`high` / `normal`）分类的计数；
+  - `QueueHigh / QueueNormal`：队列中按优先级分类的当前积压；
+  - `KeyBacklog`：每个业务键的积压明细（`Queue` / `Outstanding` /
+    `Total` / `Hot`）；
+  - `HotKeys` / `HotKeyThreshold`：达到阈值的热点键及其积压量。
 
 ## 3. 幂等与状态冲突
 
@@ -93,6 +127,12 @@
 事件源只在 sink（进入引擎）成功后推进 offset；下游拒绝/崩溃不推进，重启
 从断点重读，配合幂等实现至少一次投递 + 精确一次生效。
 
+> 优先级与公平调度的状态（两级队列、键轮转环、热点计数）全部是**内存态**，
+> 唯一新增的持久信息是事件上的 `priority` 字段（已随事件 JSON 落盘，旧文件
+> 缺省该字段时按普通优先级解析）。因此停机排空、`pending.log` 压缩与重启
+> 重放流程与之前完全一致：未 Ack 事件（含其优先级）安全重放，不会破坏既有的
+> 排空与一致性保证。
+
 ## 6. 持久化级别（配置项 `SyncEachWrite`）
 
 - `true`（默认）：每次确认通过组提交 `fsync`，操作系统崩溃也不丢已确认
@@ -115,6 +155,10 @@
 | `Backoff` | 重试基础退避（第 n 次 n×Backoff） | 5ms |
 | `ShutdownTimeout` | 优雅停机最长等待 | 5s |
 | `SyncEachWrite` | 是否逐次 fsync（组提交） | true |
+| `HotKeyBacklogThreshold` | 单键积压达到该值即判定为热点键并列入 `HotKeys` | 128 |
+
+事件字段 `Event.Priority`：`0=PriorityNormal`（缺省）、`1=PriorityHigh`；
+传入其它值一律归一化为普通优先级。
 
 ## 8. 测试覆盖
 
@@ -124,5 +168,25 @@
 - 容量背压以可区分原因拒绝并计入指标；停机期间拒绝为 `stopping`；
 - 超时/取消/普通错误归一化为可分类别；可重试错误重试后进死信；
 - 优雅停机后重启：状态不丢、pending 重放幂等、事件源 offset 断点续读。
+- **优先级与公平性（新增，`scheduling_test.go`）**：
+  - 拥塞时高优先级先于更早投递的普通优先级被消费；
+  - 同键“高优先级后继 + 普通优先级前驱”乱序/混优先级投递，最终仍严格按
+    `Seq` 生效（同键顺序与幂等不被优先级打乱）；
+  - 热点键大量涌入时冷键不被饿死（在热点键只推进部分积压时即被调度）；
+  - 热点键达到阈值后进入 `HotKeys`，`KeyBacklog` 按键可见；
+  - 队列被高优先级占满时，普通级立即得到 `priority_throttled`、高优先级
+    超时得到 `queue_full`，两种原因及按优先级计数都可区分；
+  - 队列积压按 `high/normal` 分别可观测；
+  - 混优先级事件在短超时停机 + 重启重放后结果精确一致。
 - 全部用例在 `go test ./... -race` 下稳定通过，单测日志打印关键输入与
   判定依据（版本、值、指标分类）。
+
+## 9. 本地验证
+
+```bash
+go run ./cmd/demo      # 运行示例：观察 queue_full 背压、热点键识别、分级积压
+go test ./...          # 运行全部单测
+go test ./... -race    # 并发检测（推荐）
+# 只跑优先级与公平性新增用例（可加 -count=N 反复验证稳定性）：
+go test ./engine -race -run 'TestPriority|TestSameKeyPriority|TestFair|TestHotKey' -count=10 -v
+```

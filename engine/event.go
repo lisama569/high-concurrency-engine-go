@@ -6,6 +6,35 @@ import (
 	"time"
 )
 
+// Priority 是事件的调度优先级。
+type Priority int
+
+const (
+	// PriorityNormal 普通优先级（缺省）。
+	PriorityNormal Priority = 0
+	// PriorityHigh 高优先级：队列拥塞时比低优先级更早被消费。
+	PriorityHigh Priority = 1
+)
+
+// String 返回优先级可读名称。
+func (p Priority) String() string {
+	switch p {
+	case PriorityHigh:
+		return "high"
+	default:
+		return "normal"
+	}
+}
+
+// normalizePriority 把外部传入的任意取值归一化为受支持的优先级：仅
+// PriorityHigh 被视为高优先级，其余一律按普通优先级处理。
+func normalizePriority(p Priority) Priority {
+	if p == PriorityHigh {
+		return PriorityHigh
+	}
+	return PriorityNormal
+}
+
 // Event 是引擎处理的最小事件单元。
 type Event struct {
 	// ID 事件的全局唯一标识，也是幂等去重键。
@@ -18,6 +47,10 @@ type Event struct {
 	Kind string `json:"kind"`
 	// Payload 事件负载（示例引擎中为可叠加的整数值）。
 	Payload int64 `json:"payload"`
+	// Priority 调度优先级。仅影响“不同业务键之间”被消费的先后；同一业务
+	// 键上的事件仍严格按投递（Seq）顺序生效，优先级不会打乱同键顺序。
+	// 持久化在 pending.log / events.log 中，停机重启后语义保持不变。
+	Priority Priority `json:"priority,omitempty"`
 	// EnqueueAt 事件进入引擎的时间。
 	EnqueueAt time.Time `json:"enqueue_at,omitempty"`
 }

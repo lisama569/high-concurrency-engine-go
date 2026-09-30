@@ -29,6 +29,11 @@ type Config struct {
 	Backoff time.Duration
 	// ShutdownTimeout 优雅停机最长等待时间；超时后未完成事件安全重排。
 	ShutdownTimeout time.Duration
+	// HotKeyBacklogThreshold 单个业务键被判定为“热点键”的积压阈值：该键
+	// 在队列与协调器中尚未结论的事件数（mailbox + 缺口堆 + 处理中）达到
+	// 该值即计入 MetricsSnapshot.HotKeys，便于识别长期霸占消费能力的键。
+	// <=0 时使用默认值。
+	HotKeyBacklogThreshold int
 	// SyncEachWrite 为 true（默认）时，每次状态应用都通过组提交 fsync，
 	// 保证操作系统崩溃也不丢已确认状态。false 时仅在优雅停机时统一落盘，
 	// 吞吐显著更高，但断电/OS 崩溃可能丢失最近未落盘的状态（进程崩溃与
@@ -39,16 +44,17 @@ type Config struct {
 // DefaultConfig 返回一份带默认值的配置。
 func DefaultConfig() Config {
 	return Config{
-		DataDir:         "data",
-		Workers:         runtime.NumCPU(),
-		QueuePerShard:   1024,
-		MailboxPerKey:   256,
-		SubmitTimeout:   50 * time.Millisecond,
-		HandleTimeout:   time.Second,
-		MaxAttempts:     3,
-		Backoff:         5 * time.Millisecond,
-		ShutdownTimeout: 5 * time.Second,
-		SyncEachWrite:   true,
+		DataDir:                "data",
+		Workers:                runtime.NumCPU(),
+		QueuePerShard:          1024,
+		MailboxPerKey:          256,
+		SubmitTimeout:          50 * time.Millisecond,
+		HandleTimeout:          time.Second,
+		MaxAttempts:            3,
+		Backoff:                5 * time.Millisecond,
+		ShutdownTimeout:        5 * time.Second,
+		SyncEachWrite:          true,
+		HotKeyBacklogThreshold: 128,
 	}
 }
 
@@ -81,6 +87,9 @@ func (c *Config) Validate() error {
 	}
 	if c.ShutdownTimeout <= 0 {
 		c.ShutdownTimeout = def.ShutdownTimeout
+	}
+	if c.HotKeyBacklogThreshold <= 0 {
+		c.HotKeyBacklogThreshold = def.HotKeyBacklogThreshold
 	}
 	return nil
 }
