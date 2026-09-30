@@ -18,6 +18,10 @@ type Config struct {
 	// 进入 mailbox；当某键处理能力不足导致其分片队列与 mailbox 都满时，
 	// Submit 在 SubmitTimeout 后以 KindQueueFull 明确拒绝（背压）。
 	MailboxPerKey int
+	// HotKeyBacklog 热点键识别阈值：某业务键在调度队列中的积压达到该值时，
+	// 在指标中标记为热点键（HotKeyCount / KeyBacklogs[].Hot），而不是无声
+	// 无息地拖慢全局。阈值只影响可观测标记，不改变公平轮转的调度行为。
+	HotKeyBacklog int
 	// SubmitTimeout Submit 在队列满时愿意阻塞等待的最长时间；
 	// 超过后以 KindQueueFull 明确拒绝。0 表示不等待，立即拒绝。
 	SubmitTimeout time.Duration
@@ -43,6 +47,7 @@ func DefaultConfig() Config {
 		Workers:         runtime.NumCPU(),
 		QueuePerShard:   1024,
 		MailboxPerKey:   256,
+		HotKeyBacklog:   128,
 		SubmitTimeout:   50 * time.Millisecond,
 		HandleTimeout:   time.Second,
 		MaxAttempts:     3,
@@ -66,6 +71,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MailboxPerKey <= 0 {
 		c.MailboxPerKey = def.MailboxPerKey
+	}
+	if c.HotKeyBacklog <= 0 {
+		c.HotKeyBacklog = def.HotKeyBacklog
 	}
 	if c.SubmitTimeout < 0 {
 		return newError(KindInvalid, "config.validate", "SubmitTimeout must be >= 0", nil)

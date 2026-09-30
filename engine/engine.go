@@ -7,6 +7,11 @@ import (
 	"time"
 )
 
+// handoffBackoff 是 worker 向某键交接失败（mailbox/在途暂时满）、把事件
+// 退回调度器让位后的短暂退避，防止无可服务键时空转，同时给该键协调协程
+// 排空 mailbox 的时间片。
+const handoffBackoff = 200 * time.Microsecond
+
 // Engine 是高并发事件处理引擎的主体。
 type Engine struct {
 	cfg     Config
@@ -22,7 +27,7 @@ type Engine struct {
 
 	store   Store
 	journal Journal
-	queue   *shardedQueue
+	sched   *fairScheduler
 	dlq     DeadLetter
 	source  EventSource
 	metrics *Metrics
@@ -36,6 +41,9 @@ type Engine struct {
 	sequencer *sequencer
 	// inflightSem 限制系统中“已接收待结论”的事件总数，构成处理侧背压。
 	inflightSem *countingSem
+
+	// testOnPop 仅测试用：Start 创建调度器后透传为出队观测回调。
+	testOnPop func(queuedItem)
 }
 
 // New 按配置构造引擎；此时不创建任何文件。
@@ -86,12 +94,14 @@ func (e *Engine) Start(ctx context.Context) error {
 	if e.dlq, err = openDeadLetter(filepath.Join(dir, "dead-letter.log")); err != nil {
 		return err
 	}
-	e.queue = newShardedQueue(e.cfg.Workers, e.cfg.QueuePerShard)
-	e.metrics = newMetrics(e.queue.capacity(), e.queue.depth)
+	e.sched = newFairScheduler(nextPow2(e.cfg.Workers)*e.cfg.QueuePerShard,
+		e.cfg.HotKeyBacklog)
+	e.sched.onPop = e.testOnPop
+	e.metrics = newMetrics(e.sched.depth, e.backlogStats)
 	e.sequencer = newSequencer()
 	// 在途上限 = 队列总容量 + 每键 mailbox 总量上界，给处理侧留足缓冲，
 	// 超出后事件停留在有界队列并按 SubmitTimeout 触发容量背压。
-	e.inflightSem = newCountingSem(e.queue.capacity() + e.cfg.Workers*e.cfg.MailboxPerKey)
+	e.inflightSem = newCountingSem(e.sched.capacity() + e.cfg.Workers*e.cfg.MailboxPerKey)
 
 	// 启动 worker（与队列分片一一对应，保证同键串行）。
 	for i := 0; i < e.cfg.Workers; i++ {
@@ -131,9 +141,11 @@ func (e *Engine) Start(ctx context.Context) error {
 	return nil
 }
 
-// enqueueReplay 把日志中恢复的事件重新放入内存队列。
+// enqueueReplay 把日志中恢复的事件重新放入内存调度队列。重放事件此前已被
+// 持久化接收，因此走不让位、容量满则等待的 SubmitReplay，绝不能因
+// priority_shed 被拒绝。
 func (e *Engine) enqueueReplay(ev Event) *Error {
-	return e.queue.Submit(context.Background(), queuedItem{ev: ev, attempt: 1})
+	return e.sched.SubmitReplay(context.Background(), queuedItem{ev: ev, attempt: 1})
 }
 
 // submitCtx 返回用于 Submit 等待的上下文：受 SubmitTimeout、外部 ctx 与
@@ -166,7 +178,7 @@ func (e *Engine) Submit(ctx context.Context, ev Event) *Error {
 	e.metrics.recordReceived()
 
 	if err := ev.validate(); err != nil {
-		e.metrics.recordRejected(KindInvalid)
+		e.metrics.recordRejected(KindInvalid, ev.Priority)
 		return normalize(op, err)
 	}
 	if ev.EnqueueAt.IsZero() {
@@ -177,52 +189,65 @@ func (e *Engine) Submit(ctx context.Context, ev Event) *Error {
 	stopping := e.stopped
 	e.mu.Unlock()
 	if stopping {
-		e.metrics.recordRejected(KindStopping)
+		e.metrics.recordRejected(KindStopping, ev.Priority)
 		return newError(KindStopping, op,
 			"engine is shutting down; reject new event "+ev.ID, nil)
 	}
 
 	// 先落盘待处理日志，再入内存队列，保证任何拒绝/崩溃后事件仍可重放。
 	if err := e.journal.Append(ctx, ev); err != nil {
-		e.metrics.recordRejected(KindStorage)
+		e.metrics.recordRejected(KindStorage, ev.Priority)
 		return normalize(op, err)
 	}
 
 	qctx, cancel := e.submitCtx(ctx)
 	defer cancel()
-	if perr := e.queue.Submit(qctx, queuedItem{ev: ev, attempt: 1}); perr != nil {
-		// 入队失败（背压/停机）：事件已在持久日志里，拒绝原因可区分，
-		// 不会丢失；调用方可按 Retryable 决定稍后重投或依赖重启重放。
-		e.metrics.recordRejected(perr.Kind)
+	if perr := e.sched.Submit(qctx, queuedItem{ev: ev, attempt: 1}); perr != nil {
+		// 入队失败（容量背压/优先级让位/停机）：事件已在持久日志里，拒绝
+		// 原因可区分，不会丢失；调用方可按 Retryable 决定稍后重投或依赖重启
+		// 重放。
+		e.metrics.recordRejected(perr.Kind, ev.Priority)
 		return perr
 	}
-	e.metrics.recordAccepted()
+	e.metrics.recordAccepted(ev.Priority)
 	return nil
 }
 
-// runWorker 消费一个分片，把每个事件路由到其业务键的串行协调协程。
+// runWorker 从公平调度器领取一个“键交接”，尝试把队头事件投递到该键协调协程。
+// 调度器对每个业务键做单航班交接：claim 时该键离环，因此同一时刻一个键只有
+// 一件事件在交接路上，保证进入该键 mailbox 的顺序恒等于出队顺序（同键不乱
+// 序），即便多个 worker 并发也如此。
 //
-// dispatch 可能因为：
-//   - 目标键 mailbox 满（该键处理能力不足）：不能静默丢弃，把事件退回分片
-//     队列稍后重试；队列也满则短退避后重试，直到停机（事件始终在队列或
-//     mailbox 中，且持久日志兜底，绝不丢失）；
-//   - 停机 finishCh 关闭：放弃重试，事件未 Ack，保留在 pending.log 重放。
-func (e *Engine) runWorker(idx int) {
+// 交接结论三选一：
+//   - 投递成功（mailbox 有空位、在途有槽）：confirmDelivered，仍有积压的键
+//     被挂到环尾，与其它键逐键轮转；
+//   - 该键暂时满（mailbox 满或在途信号量耗尽）：returnHead 把事件放回该键
+//     队头并把键挂环尾让位，本 worker 立即转而服务其它键——慢业务键只拖自己，
+//     不能霸占消费能力；
+//   - 停机：dropHead 放弃交接，事件未 Ack，保留 pending.log 重放。
+func (e *Engine) runWorker(_ int) {
 	defer e.wg.Done()
-	ch := e.queue.shardChan(idx)
-	for item := range ch {
-		for {
-			if e.dispatch(item) {
-				break
-			}
+	for {
+		kq, item, ok := e.sched.pop()
+		if !ok {
+			return // 调度器已关闭且取空
+		}
+		k := e.coordinatorFor(item.ev.Key)
+		switch k.deliver(item) {
+		case 1:
+			e.sched.confirmDelivered(kq)
+		case 0:
 			if e.isFinish() {
-				break // 停机：不 Ack，事件随日志重放
+				e.sched.dropHead(kq) // 停机：不重投、不 Ack，等待重放
+			} else {
+				// 让位：本轮先服务其它键。这里短暂退避，避免“无其它可服务
+				// 键且该键暂时满”时 worker 在 claim/退回 上空转烧 CPU；把
+				// 时间片让给该键协调协程排空 mailbox。
+				e.sched.returnHead(kq, item)
+				time.Sleep(handoffBackoff)
 			}
-			// mailbox 背压：退回队列重试。非阻塞放回（当前就是从该通道取
-			// 出，必有空位），再让出时间片给目标键协调协程追赶。
-			if !e.queue.trySend(idx, item) {
-				time.Sleep(200 * time.Microsecond)
-			}
+		default: // -1：停机
+			e.sched.dropHead(kq)
 		}
 	}
 }
@@ -381,7 +406,7 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 	e.mu.Unlock()
 
 	close(e.stopCh)
-	e.queue.markStopping()
+	e.sched.markStopping()
 
 	// 停止事件源投递，不再有新的持久化事件进入。
 	if e.sourceCancel != nil {
@@ -400,7 +425,10 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 	defer ticker.Stop()
 	drained := false
 	for {
-		if e.queue.depth() == 0 && e.outstandingCount() == 0 {
+		// depth=仍在调度队列；inFlightHandoffs=已取出但尚未进入 coordinator
+		// mailbox 的交接中事件；outstandingCount=协调器侧在途。三者皆零才算
+		// 真正排空，避免在“claim 后、交接完成前”的窗口误判。
+		if e.sched.depth() == 0 && e.sched.inFlightHandoffs() == 0 && e.outstandingCount() == 0 {
 			drained = true
 			break
 		}
@@ -417,9 +445,9 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 	// 第二阶段：先通知所有业务键协调协程停机，解除它们在处理/退避/缺口上
 	// 的阻塞；未 Ack 事件保留在 pending.log 由下次启动重放。
 	e.stopCoordinators()
-	// 再关闭分片通道并等待 worker 退出。此时 deliver 若仍阻塞会因 stopCh
-	// 立即返回 false，worker 得以收尾。
-	e.queue.close()
+	// 再关闭调度器：残余事件先被 pop 出（随后因 finishCh 不 Ack），取空后
+	// worker 退出；未 Ack 事件保留在 pending.log 由下次启动重放。
+	e.sched.close()
 	e.wg.Wait()
 
 	var firstErr error
@@ -449,10 +477,73 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 	return firstErr
 }
 
+// backlogStats 合并调度器（按优先级可拆）与每键协调器两段的在途数据，
+// 产出按优先级与业务键维度的积压快照，并依据调度器阈值标记热点键。
+func (e *Engine) backlogStats() BacklogSnapshot {
+	st := e.sched.stats()
+	coord := e.outstandingByKey()
+
+	merged := make(map[string]*KeyBacklog, len(st.Keys)+len(coord))
+	get := func(k string) *KeyBacklog {
+		b, ok := merged[k]
+		if !ok {
+			b = &KeyBacklog{Key: k}
+			merged[k] = b
+		}
+		return b
+	}
+	for i := range st.Keys {
+		ks := st.Keys[i]
+		b := get(ks.Key)
+		b.Sched = ks.Total
+		b.Normal += ks.ByPri[PriorityNormal]
+		b.High += ks.ByPri[PriorityHigh]
+		if ks.Hot {
+			b.Hot = true
+		}
+	}
+	for k, st := range coord {
+		if st.total <= 0 {
+			continue
+		}
+		b := get(k)
+		b.Coord = st.total
+		b.Normal += st.byPri[PriorityNormal]
+		b.High += st.byPri[PriorityHigh]
+	}
+	out := BacklogSnapshot{
+		Capacity:     st.Capacity,
+		Depth:        st.Depth,
+		Normal:       st.ByPri[PriorityNormal],
+		High:         st.ByPri[PriorityHigh],
+		HotThreshold: st.HotThreshold,
+	}
+	for _, b := range merged {
+		b.Total = b.Sched + b.Coord
+		if b.Total > 0 {
+			// 热点键按“该键总积压（调度队列 + 协调器）”是否达到阈值识别，
+			// 即使事件已被快速拉进该键 mailbox，也不会无声无息地拖慢全局。
+			if b.Total >= st.HotThreshold {
+				b.Hot = true
+				out.HotKeyCount++
+			}
+			out.Keys = append(out.Keys, *b)
+		}
+	}
+	sortKeyBacklogs(out.Keys)
+	return out
+}
+
 // Metrics 返回当前可观测指标快照。
 func (e *Engine) Metrics() MetricsSnapshot {
 	if e.metrics == nil {
-		return MetricsSnapshot{RejectReason: map[string]int64{}}
+		return MetricsSnapshot{
+			RejectReason:    map[string]int64{},
+			AcceptedByPri:   map[string]int64{},
+			RejectedByPri:   map[string]int64{},
+			RejectByKindPri: map[string]int64{},
+			QueueDepthByPri: map[string]int{},
+		}
 	}
 	return e.metrics.Snapshot()
 }

@@ -36,6 +36,9 @@ type keyCoordinator struct {
 	mu       sync.Mutex
 	waitHeap pendingHeap
 	busy     bool
+	// stagePri 统计当前处于协调器侧（mailbox + 缺口堆 + 处理中）的各优先级
+	// 事件数：deliver 成功时增加，事件 finalize 后减少，全程持有 c.mu。
+	stagePri [priorityCount]int
 	// hasWork 在“mailbox 为空但 waitHeap 中可能存在可推进事件”时作为兜底
 	// 唤醒信号：advance 应用前驱后若堆里还有事件，会非阻塞触发一次自调度。
 	reschedule chan struct{}
@@ -66,19 +69,32 @@ func (c *keyCoordinator) kick() {
 	}
 }
 
-// deliver 投递事件到该键 mailbox。mailbox 满时阻塞等待空位（天然对慢业务
-// 键形成背压，且只阻塞投递该键的 worker，不影响其它键）；停机则返回
-// false。在途槽位在事件 finalize 时释放，恒等于“已接收未结论”数。
-func (c *keyCoordinator) deliver(item queuedItem) bool {
-	if !c.eng.inflightSem.acquire(c.eng.finishCh) {
-		return false
+// deliver 尝试把事件投递到该键 mailbox。它必须是非阻塞的：调度器对每个
+// 业务键采用“单航班”交接（claim 时该键离环），若此处阻塞，该键既不在环
+// 上、又占住一个 worker，会拖死轮转。因此：
+//   - 在途信号量有槽且 mailbox 有空位：立即投递成功，返回 true；
+//   - 信号量耗尽或 mailbox 满：返回 false，调用方把事件退回调度器并让该键
+//     本轮让位（挂环尾），worker 转而去服务其它键，稍后该键 coordinator
+//     排空后自然重新轮到——既对慢业务键背压，又不牺牲键间公平；
+//   - 停机：返回 -1，事件不再重投，保留 pending.log 重放。
+//
+// 返回值：1=已投递，0=暂时满（应退回让位），-1=停机（应丢弃交接）。
+func (c *keyCoordinator) deliver(item queuedItem) int {
+	if !c.eng.inflightSem.tryAcquire() {
+		return 0
 	}
 	select {
 	case c.mailbox <- item:
-		return true
+		c.mu.Lock()
+		c.stagePri[normalizePriority(item.ev.Priority)]++
+		c.mu.Unlock()
+		return 1
 	case <-c.eng.finishCh:
 		c.eng.inflightSem.release()
-		return false
+		return -1
+	default:
+		c.eng.inflightSem.release()
+		return 0
 	}
 }
 
@@ -129,11 +145,15 @@ func (c *keyCoordinator) processOne(item queuedItem) {
 	c.advance()
 }
 
-// handleOutcome 对一个已弹出堆的事件给出最终结论，并只在此时释放在途槽位。
+// handleOutcome 对一个已弹出堆的事件给出最终结论，并只在此时释放在途槽位
+// 与协调器侧积压计数。
 func (c *keyCoordinator) handleOutcome(item queuedItem) {
 	outcome, perr := c.eng.processWithRetry(item)
 	c.eng.finalize(item, outcome, perr)
 	c.eng.inflightSem.release()
+	c.mu.Lock()
+	c.stagePri[normalizePriority(item.ev.Priority)]--
+	c.mu.Unlock()
 }
 
 // advance 从堆顶连续处理序号衔接的事件，直到遇到缺口或堆空。每次成功推进
@@ -164,6 +184,7 @@ func (c *keyCoordinator) advance() {
 		if gerr != nil {
 			c.mu.Lock()
 			heap.Pop(&c.waitHeap)
+			c.stagePri[normalizePriority(top.ev.Priority)]--
 			c.mu.Unlock()
 			c.eng.finalize(top, OutcomeFailed, normalize("engine.order.get", gerr))
 			c.eng.inflightSem.release()
@@ -207,36 +228,53 @@ func newSequencer() *sequencer {
 	return &sequencer{keys: make(map[string]*keyCoordinator)}
 }
 
-func (e *Engine) dispatch(item queuedItem) bool {
+// coordinatorFor 返回（必要时懒创建）业务键的串行协调协程。
+func (e *Engine) coordinatorFor(key string) *keyCoordinator {
 	e.sequencer.mu.Lock()
-	k, ok := e.sequencer.keys[item.ev.Key]
+	k, ok := e.sequencer.keys[key]
 	if !ok {
-		k = newKeyCoordinator(e, item.ev.Key)
-		e.sequencer.keys[item.ev.Key] = k
+		k = newKeyCoordinator(e, key)
+		e.sequencer.keys[key] = k
 	}
 	e.sequencer.mu.Unlock()
-	return k.deliver(item)
+	return k
 }
 
 // outstandingCount 返回所有键 mailbox、缺口堆与处理中事件的总数。
 func (e *Engine) outstandingCount() int {
+	n := 0
+	for _, st := range e.outstandingByKey() {
+		n += st.total
+	}
+	return n
+}
+
+// coordKeyStat 是单个业务键在协调器侧（mailbox + 缺口堆 + 处理中）的
+// 在途统计，按优先级拆分供可观测使用。
+type coordKeyStat struct {
+	total int
+	byPri [priorityCount]int
+}
+
+// outstandingByKey 返回每个业务键在协调器侧的在途统计。
+func (e *Engine) outstandingByKey() map[string]coordKeyStat {
 	e.sequencer.mu.Lock()
 	ks := make([]*keyCoordinator, 0, len(e.sequencer.keys))
 	for _, k := range e.sequencer.keys {
 		ks = append(ks, k)
 	}
 	e.sequencer.mu.Unlock()
-	n := 0
+	out := make(map[string]coordKeyStat, len(ks))
 	for _, k := range ks {
 		k.mu.Lock()
-		n += k.waitHeap.Len()
-		n += len(k.mailbox)
-		if k.busy {
-			n++
-		}
+		st := coordKeyStat{byPri: k.stagePri}
+		st.total = st.byPri[PriorityNormal] + st.byPri[PriorityHigh]
 		k.mu.Unlock()
+		if st.total > 0 {
+			out[k.key] = st
+		}
 	}
-	return n
+	return out
 }
 
 func (e *Engine) stopCoordinators() {
@@ -266,11 +304,12 @@ func newCountingSem(n int) *countingSem {
 	return &countingSem{ch: make(chan struct{}, n)}
 }
 
-func (s *countingSem) acquire(stop <-chan struct{}) bool {
+// tryAcquire 非阻塞地获取一个在途槽位；满时返回 false。
+func (s *countingSem) tryAcquire() bool {
 	select {
 	case s.ch <- struct{}{}:
 		return true
-	case <-stop:
+	default:
 		return false
 	}
 }

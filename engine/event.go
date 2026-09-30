@@ -18,8 +18,37 @@ type Event struct {
 	Kind string `json:"kind"`
 	// Payload 事件负载（示例引擎中为可叠加的整数值）。
 	Payload int64 `json:"payload"`
+	// Priority 事件调度优先级：PriorityNormal(0)=普通，PriorityHigh(1)=高。
+	// 拥塞时高优先级事件在跨业务键维度被更早消费；同一业务键上的事件严格
+	// 按投递/Seq 顺序生效，优先级不会打乱同键顺序。未填（0）按普通处理，
+	// 随 pending.log / events.log 一起持久化，重启重放后优先级保持不变。
+	Priority int `json:"priority,omitempty"`
 	// EnqueueAt 事件进入引擎的时间。
 	EnqueueAt time.Time `json:"enqueue_at,omitempty"`
+}
+
+const (
+	// PriorityNormal 普通优先级（默认）。
+	PriorityNormal = 0
+	// PriorityHigh 高优先级：队列拥塞时跨键优先于普通事件被消费。
+	PriorityHigh = 1
+)
+
+// normalizePriority 把任意输入归一化为引擎支持的两级优先级：>0 视为高
+// 优先级，<=0 视为普通。调用方保证非法（负）值已在事件校验阶段被拒绝。
+func normalizePriority(p int) int {
+	if p > PriorityNormal {
+		return PriorityHigh
+	}
+	return PriorityNormal
+}
+
+// priorityName 返回指标与日志中使用的稳定优先级维度名。
+func priorityName(p int) string {
+	if normalizePriority(p) == PriorityHigh {
+		return "high"
+	}
+	return "normal"
 }
 
 // Outcome 是单个事件的处理结论。
@@ -78,6 +107,9 @@ func (ev Event) validate() error {
 	}
 	if ev.Seq < 1 {
 		return newError(KindInvalid, "event.validate", "event seq must be >= 1", nil)
+	}
+	if ev.Priority < 0 {
+		return newError(KindInvalid, "event.validate", "event priority must be >= 0", nil)
 	}
 	return nil
 }

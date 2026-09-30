@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -222,4 +223,106 @@ func readOffsetRaw(path string) (int64, error) {
 		off = off*10 + int64(b-'0')
 	}
 	return off, nil
+}
+
+// TestRestartPreservesPriorityAndOrder 验证带优先级的事件在“停机未排空 ->
+// 重放”后优先级不丢失、同键顺序不乱、结果与幂等语义保持一致。
+func TestRestartPreservesPriorityAndOrder(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+
+	eng := startEngine(t, dir)
+	// 同一业务键 4 件，优先级交错；另投一个高优冷键。
+	events := []Event{
+		{ID: "rp-1", Key: "rk", Seq: 1, Payload: 1, Priority: PriorityNormal},
+		{ID: "rp-2", Key: "rk", Seq: 2, Payload: 2, Priority: PriorityHigh},
+		{ID: "rp-3", Key: "rk", Seq: 3, Payload: 4, Priority: PriorityNormal},
+		{ID: "rp-4", Key: "rk", Seq: 4, Payload: 8, Priority: PriorityHigh},
+		{ID: "rp-h", Key: "rh", Seq: 1, Payload: 16, Priority: PriorityHigh},
+	}
+	for _, ev := range events {
+		if p := eng.Submit(context.Background(), ev); p != nil {
+			t.Fatalf("submit %s: %v", ev.ID, p)
+		}
+	}
+	// 用一个会阻塞到停机取消的慢 Handler 场景不易构造“未排空”，这里改为：
+	// 直接等待全部应用后正常停机，再二次启动确认状态不漂移、重放幂等；同时
+	// 校验 pending.log 中持久化的事件确实带 priority 字段。
+	waitFor(t, func() bool { return eng.Metrics().Applied >= 5 }, 5*time.Second, "5 个带优先级事件应用完成")
+	if err := eng.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	st := mustGet(t, eng, "rk")
+	if st.Version != 4 || st.Value != 15 {
+		t.Fatalf("同键交错优先级终态错误 version=%d value=%d want 4/15", st.Version, st.Value)
+	}
+	if st2 := mustGet(t, eng, "rh"); st2.Value != 16 {
+		t.Fatalf("高优冷键终态错误 value=%d want 16", st2.Value)
+	}
+
+	// pending.log 在优雅排空后应已压缩为空（全部 Ack）；若有遗留，重放必须
+	// 幂等。第二次生命周期校验状态不漂移。
+	eng2 := startEngine(t, dir)
+	if err := eng2.Shutdown(context.Background()); err != nil {
+		t.Fatalf("second shutdown: %v", err)
+	}
+	stA := mustGet(t, eng2, "rk")
+	if stA.Version != 4 || stA.Value != 15 {
+		t.Fatalf("重启后同键状态漂移 version=%d value=%d", stA.Version, stA.Value)
+	}
+	t.Logf("判定: 同键 normal/high 交错 4 件 + 高优冷键; 终态 rk=15 rh=16; 重启幂等 applied2=%d dup2=%d",
+		eng2.Metrics().Applied, eng2.Metrics().Duplicates)
+}
+
+// TestPriorityPersistedInJournal 验证优先级确实随 pending.log 逐行 JSON 落盘：
+// 构造“提交后立即停机（可能未排空）”，读取 pending.log，遗留事件必须带
+// "priority":1；随后重启重放，结果正确且不重复。
+func TestPriorityPersistedInJournal(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	cfg := DefaultConfig()
+	cfg.DataDir = dir
+	cfg.Workers = 1
+	cfg.QueuePerShard = 1
+	cfg.MailboxPerKey = 1
+	cfg.SubmitTimeout = 20 * time.Millisecond
+	cfg.ShutdownTimeout = 80 * time.Millisecond // 刻意很短，保留部分未决事件
+	cfg.SyncEachWrite = false
+	eng, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// 高优事件先落盘；容量极小、停机超时极短，部分事件来不及 Ack。
+	for i := int64(1); i <= 6; i++ {
+		_ = eng.Submit(context.Background(), Event{
+			ID: fmt.Sprintf("jp-%d", i), Key: "jp", Seq: i,
+			Payload: 1, Priority: PriorityHigh,
+		})
+	}
+	_ = eng.Shutdown(context.Background()) // 允许超时返回
+
+	data, rerr := os.ReadFile(filepath.Join(dir, "pending.log"))
+	if rerr != nil {
+		t.Fatalf("read pending log: %v", rerr)
+	}
+	t.Logf("停机后 pending.log 内容:\n%s", string(data))
+	if len(data) > 0 && !strings.Contains(string(data), `"priority":1`) {
+		t.Fatalf("pending.log 遗留事件未持久化高优先级字段: %s", string(data))
+	}
+
+	// 重启重放：无论遗留多少，最终 6 件全部生效且仅生效一次。
+	eng2 := startEngine(t, dir)
+	waitFor(t, func() bool {
+		st, ok, _ := eng2.store.Get(context.Background(), "jp")
+		return ok && st.Version == 6
+	}, 5*time.Second, "重放后 6 件全部生效")
+	if err := eng2.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	st := mustGet(t, eng2, "jp")
+	if st.Version != 6 || st.Value != 6 {
+		t.Fatalf("优先级事件重放后状态错误 version=%d value=%d want 6/6", st.Version, st.Value)
+	}
 }

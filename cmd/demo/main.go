@@ -38,6 +38,7 @@ func main() {
 	cfg.Workers = 8
 	cfg.QueuePerShard = 16 // 刻意很小，便于在演示中观察 queue_full 背压
 	cfg.MailboxPerKey = 16
+	cfg.HotKeyBacklog = 24 // 单键在途积压达到即标记热点键
 	cfg.SubmitTimeout = 5 * time.Millisecond
 	cfg.MaxAttempts = 3
 	cfg.Backoff = time.Millisecond
@@ -80,8 +81,10 @@ func main() {
 				mu.Lock()
 				rejects[ee.Kind.String()]++
 				mu.Unlock()
-				if ee.Kind == engine.KindQueueFull {
-					time.Sleep(time.Millisecond) // 背压：稍后重试，事件不丢
+				// queue_full=真正容量耗尽；priority_shed=拥塞让位高优先级。
+				// 两者都可安全重试（事件已在持久日志），稍后重投即可。
+				if ee.Kind == engine.KindQueueFull || ee.Kind == engine.KindPriorityShed {
+					time.Sleep(time.Millisecond) // 背压/让位：稍后重试，事件不丢
 					continue
 				}
 			}
@@ -96,12 +99,19 @@ func main() {
 			defer wg.Done()
 			for i := 0; i < perKey; i++ {
 				key := fmt.Sprintf("k%d", g%8)
+				// 每键每 50 件放 1 件高优先级，演示同键优先级交错但顺序不乱、
+				// 以及跨键拥塞时高优先被更早消费。
+				pri := engine.PriorityNormal
+				if i%50 == 49 {
+					pri = engine.PriorityHigh
+				}
 				submitWithRetry(engine.Event{
-					ID:      fmt.Sprintf("e-%s-%d", key, i+1),
-					Key:     key,
-					Seq:     int64(i + 1),
-					Kind:    "add",
-					Payload: 1,
+					ID:       fmt.Sprintf("e-%s-%d", key, i+1),
+					Key:      key,
+					Seq:      int64(i + 1),
+					Kind:     "add",
+					Payload:  1,
+					Priority: pri,
 				})
 			}
 		}(g)
@@ -109,6 +119,45 @@ func main() {
 	wg.Wait()
 	logger.Printf("burst finished in %v; backpressure rejections(retried) by reason: %v",
 		time.Since(t0), rejects)
+
+	// 公平性演示：单个热点键大量涌入时，一个冷键高优事件仍应很快被处理，
+	// 且热点键会在指标中被显式识别而不是无声拖慢全局。
+	doneHot := make(chan struct{})
+	go func() {
+		defer close(doneHot)
+		for i := int64(1); i <= 2000; i++ {
+			submitWithRetry(engine.Event{
+				ID: fmt.Sprintf("hotburst-%d", i), Key: "hotburst",
+				Seq: i, Kind: "add", Payload: 1, Priority: engine.PriorityNormal,
+			})
+		}
+	}()
+	time.Sleep(10 * time.Millisecond) // 让热点键先积压
+	coldStart := time.Now()
+	submitWithRetry(engine.Event{
+		ID: "cold-urgent", Key: "coldburst", Seq: 1, Kind: "add",
+		Payload: 1, Priority: engine.PriorityHigh,
+	})
+	logger.Printf("cold high-priority key enqueued behind a hot-key burst; waiting for it to be applied ...")
+	// 轮询直到冷键生效，打印等待耗时与此刻热点键可观测积压。
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		states, _ := eng.StateSnapshot(ctx)
+		if _, ok := states["coldburst"]; ok {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	mc := eng.Metrics()
+	logger.Printf("fairness: cold high-priority key applied within %v; hotKeyCount=%d threshold=%d",
+		time.Since(coldStart), mc.HotKeyCount, mc.HotThreshold)
+	for _, kb := range mc.KeyBacklogs {
+		if kb.Key == "hotburst" {
+			logger.Printf("fairness: hotburst backlog total=%d (sched=%d coord=%d) hot=%v",
+				kb.Total, kb.Sched, kb.Coord, kb.Hot)
+		}
+	}
+	<-doneHot
 
 	// 追加重复投递：相同 ID 必须被幂等拦截。
 	dup := engine.Event{ID: "e-k0-1", Key: "k0", Seq: 1, Kind: "add", Payload: 1}
@@ -169,6 +218,17 @@ func printMetrics(logger *log.Logger, eng *engine.Engine) {
 		m.Received, m.Accepted, m.Rejected, m.InFlight)
 	logger.Printf("metrics: applied=%d duplicates=%d conflicts=%d failed=%d retried=%d",
 		m.Applied, m.Duplicates, m.Conflicts, m.Failed, m.Retried)
-	logger.Printf("backlog: depth=%d/%d rejectReasons=%v",
-		m.QueueDepth, m.QueueMax, m.RejectReason)
+	logger.Printf("backlog: depth=%d/%d byPriority=%+v rejectReasons=%v",
+		m.QueueDepth, m.QueueMax, m.QueueDepthByPri, m.RejectReason)
+	logger.Printf("priority: acceptedByPri=%+v rejectedByPri=%+v rejectByKindPri=%+v",
+		m.AcceptedByPri, m.RejectedByPri, m.RejectByKindPri)
+	logger.Printf("hot keys: threshold=%d hotKeyCount=%d", m.HotThreshold, m.HotKeyCount)
+	for i, kb := range m.KeyBacklogs {
+		if i >= 8 {
+			logger.Printf("hot keys: ...(%d more)", len(m.KeyBacklogs)-8)
+			break
+		}
+		logger.Printf("  key=%s total=%d (sched=%d coord=%d normal=%d high=%d hot=%v)",
+			kb.Key, kb.Total, kb.Sched, kb.Coord, kb.Normal, kb.High, kb.Hot)
+	}
 }
