@@ -113,13 +113,15 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 
 	// 重放上次未 Ack 的事件：它们已在持久日志中，直接重新入队即可，
-	// 不再次 Append；重复应用由存储层幂等判重拦截。
+	// 不再次 Append；重复应用由存储层幂等判重拦截。恢复路径不套用正常
+	// 运行时的优先级限流/背压拒绝：存量事件无论积压多大、优先级怎么混，
+	// 都必须全部重新入队（分片满时阻塞等待 worker 腾出空位）。
 	pending, err := e.journal.Replay(ctx)
 	if err != nil {
 		return err
 	}
 	for _, ev := range pending {
-		if perr := e.enqueueReplay(ev); perr != nil {
+		if perr := e.enqueueReplay(ctx, ev); perr != nil {
 			return perr
 		}
 	}
@@ -144,9 +146,11 @@ func (e *Engine) Start(ctx context.Context) error {
 	return nil
 }
 
-// enqueueReplay 把日志中恢复的事件重新放入内存队列。
-func (e *Engine) enqueueReplay(ev Event) *Error {
-	return e.queue.Submit(context.Background(), queuedItem{ev: ev, attempt: 1})
+// enqueueReplay 把日志中恢复的事件重新放入内存队列。走恢复专用入队路径：
+// 不因“高优先级积压占满分片”而拒绝普通优先级的存量事件，分片满时阻塞
+// 等待空位（worker 已在运行，会持续腾出容量），仅随 ctx 取消或停机返回。
+func (e *Engine) enqueueReplay(ctx context.Context, ev Event) *Error {
+	return e.queue.SubmitReplay(ctx, queuedItem{ev: ev, attempt: 1})
 }
 
 // submitCtx 返回用于 Submit 等待的上下文：受 SubmitTimeout、外部 ctx 与

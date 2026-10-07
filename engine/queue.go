@@ -257,6 +257,19 @@ func (q *shardedQueue) shardOf(key string) int {
 //   - KindStopping：停机中；
 //   - KindCanceled：外部 ctx 主动取消。
 func (q *shardedQueue) Submit(ctx context.Context, item queuedItem) *Error {
+	return q.submit(ctx, item, false)
+}
+
+// SubmitReplay 是重启恢复专用的入队路径：重放的是已落盘的存量事件，必须
+// 全部重新入队，因此不套用正常运行时的优先级限流（KindPriorityThrottled）
+// 与 SubmitTimeout 背压拒绝——分片满时阻塞等待 worker 腾出空位，直到
+// ctx 取消或停机。优先级仍随事件保留，只影响入队后的消费先后。
+func (q *shardedQueue) SubmitReplay(ctx context.Context, item queuedItem) *Error {
+	return q.submit(ctx, item, true)
+}
+
+// submit 是入队主流程；replay=true 时跳过优先级限流，分片满一律等待空位。
+func (q *shardedQueue) submit(ctx context.Context, item queuedItem, replay bool) *Error {
 	const op = "queue.submit"
 	lv := normalizePriority(item.ev.Priority)
 	item.ev.Priority = lv
@@ -286,9 +299,10 @@ func (q *shardedQueue) Submit(ctx context.Context, item queuedItem) *Error {
 			return nil
 		}
 		// 容量已满。
-		if lv == PriorityNormal && s.levelLenLocked(PriorityHigh) > 0 {
+		if !replay && lv == PriorityNormal && s.levelLenLocked(PriorityHigh) > 0 {
 			// 拥塞由高优先级积压造成：普通优先级不等待，原因与“真正容量
-			// 耗尽”区分开。
+			// 耗尽”区分开。恢复重放（replay）不走此限流：存量事件必须全部
+			// 重新入队，改为阻塞等待空位。
 			s.mu.Unlock()
 			return newError(KindPriorityThrottled, op,
 				"normal-priority event throttled: shard congested by high-priority backlog", nil)

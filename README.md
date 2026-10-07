@@ -133,6 +133,26 @@
 > 重放流程与之前完全一致：未 Ack 事件（含其优先级）安全重放，不会破坏既有的
 > 排空与一致性保证。
 
+### 5.1 恢复路径与优先级限流的边界
+
+重启恢复（`Start` 重放 `pending.log`）**不套用**正常运行时的优先级限流与
+背压拒绝规则：
+
+- 正常运行时，`priority_throttled` / `queue_full` 是面向**新投递**的拥塞
+  保护；而恢复重放的是**已落盘的存量事件**，职责是把它们全部重新排空，
+  不存在“拒绝”的语义空间。
+- 因此恢复专用入队路径（`shardedQueue.SubmitReplay`）在分片被高优先级
+  积压占满时**不会**对普通优先级存量事件返回 `priority_throttled`，而是
+  阻塞等待 worker 腾出空位，直到全部存量重新入队（仅随 `Start` 的 ctx
+  取消或停机而中断）。无论上次遗留的积压多大、高低优先级怎么混，恢复都
+  不会中途失败或卡死。
+- 恢复后的事件仍携带原优先级，只影响不同键之间的消费先后；同一业务键在
+  恢复期内仍由唯一协调协程按 `Seq` 顺序生效，重复投递/重放由存储层幂等
+  判重，不会重复生效。
+- 一致性保证：带积压停机再重启恢复的最终状态，与“不重启、一直跑到自然
+  排空”的结果**逐键完全一致**（由 `TestRestartRecoveryBypassesPriorityThrottle`
+  的参考组对照验证）。
+
 ## 6. 持久化级别（配置项 `SyncEachWrite`）
 
 - `true`（默认）：每次确认通过组提交 `fsync`，操作系统崩溃也不丢已确认
@@ -178,6 +198,13 @@
     超时得到 `queue_full`，两种原因及按优先级计数都可区分；
   - 队列积压按 `high/normal` 分别可观测；
   - 混优先级事件在短超时停机 + 重启重放后结果精确一致。
+- **恢复路径与限流边界（新增，`recovery_test.go`）**：
+  - 停机时遗留“高低优先级混合、超过单分片容量”的积压，重启恢复启动
+    成功并全部按键生效，终态与“不重启直接跑完”的参考组逐键一致
+    （恢复不被 `priority_throttled` 打断）；
+  - 多 worker、多业务键并发恢复大积压：不漏事件、不重复生效、不死等；
+  - 正常运行时的 `priority_throttled` / `queue_full` 拒绝语义保持不变
+    （`scheduling_test.go` 既有用例回归）。
 - 全部用例在 `go test ./... -race` 下稳定通过，单测日志打印关键输入与
   判定依据（版本、值、指标分类）。
 
@@ -189,4 +216,6 @@ go test ./...          # 运行全部单测
 go test ./... -race    # 并发检测（推荐）
 # 只跑优先级与公平性新增用例（可加 -count=N 反复验证稳定性）：
 go test ./engine -race -run 'TestPriority|TestSameKeyPriority|TestFair|TestHotKey' -count=10 -v
+# 只跑重启恢复与限流边界用例（含超容量混合优先级积压的确定性复现）：
+go test ./engine -race -run 'TestRestartRecovery|TestRestart|TestReplay' -count=10 -v
 ```
