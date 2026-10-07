@@ -11,6 +11,10 @@ import (
 type queuedItem struct {
 	ev      Event
 	attempt int
+	// replay 为 true 表示该条目来自重启恢复（pending.log 重放）。恢复只是
+	// 把已落盘的存量排空，不套用运行期规则：入队不受容量上限与优先级限流
+	// 约束，投递时不占用在途信号量（见 keyCoordinator.deliver）。
+	replay bool
 }
 
 // keyQueue 是一个业务键在分片内的 FIFO 缓冲。
@@ -331,6 +335,34 @@ func (q *shardedQueue) Submit(ctx context.Context, item queuedItem) *Error {
 		delete(s.waiters, wake)
 		// 循环回到顶部重新判定容量/停机/截止/拥塞。
 	}
+}
+
+// submitReplay 恢复专用入口：把已持久化的存量事件放回分片队列。
+//
+// 与 Submit 的边界：恢复不是接收新工作，而是排空已落盘存量，因此不套用
+// 运行期的拒绝规则——
+//   - 不检查容量上限（used 允许暂时超过 capN，随消费自然回落；此后运行期
+//     Submit 在积压回落到容量内之前照常等待/拒绝，背压语义不变）；
+//   - 不因“高优先级积压”拒绝普通优先级事件（无 KindPriorityThrottled）；
+//   - 不阻塞等待空位，入队即返回，恢复绝不会被运行期背压卡住。
+//
+// 仅在分片已停机/关闭时返回 KindStopping（正常 Start 流程中不会发生）。
+func (q *shardedQueue) submitReplay(item queuedItem) *Error {
+	const op = "queue.replay"
+	lv := normalizePriority(item.ev.Priority)
+	item.ev.Priority = lv
+	item.replay = true
+	s := q.shards[q.shardOf(item.ev.Key)]
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.stopped {
+		return newError(KindStopping, op,
+			"engine is shutting down; event retained in durable journal for replay", nil)
+	}
+	s.pushLocked(lv, item)
+	s.notifyLocked() // 唤醒等待中的 worker
+	return nil
 }
 
 // pop 取下一个待处理事件；当前仅有被高优先级压制的普通级或队列空时阻塞。

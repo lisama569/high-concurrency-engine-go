@@ -69,7 +69,21 @@ func (c *keyCoordinator) kick() {
 // deliver 投递事件到该键 mailbox。mailbox 满时阻塞等待空位（天然对慢业务
 // 键形成背压，且只阻塞投递该键的 worker，不影响其它键）；停机则返回
 // false。在途槽位在事件 finalize 时释放，恒等于“已接收未结论”数。
+//
+// 恢复事件（item.replay）不占用在途信号量：信号量是运行期背压手段，而
+// 恢复是排空已落盘存量。若恢复事件也占槽位，恢复期优先级反转（高优先级
+// 的大序号先进入缺口堆等待前驱）会让缺口等待事件耗尽槽位，而前驱仍滞留
+// 在分片队列中无法投递，造成恢复期死等。mailbox 容量本身仍对恢复事件
+// 形成有界缓冲，不会失控。
 func (c *keyCoordinator) deliver(item queuedItem) bool {
+	if item.replay {
+		select {
+		case c.mailbox <- item:
+			return true
+		case <-c.eng.finishCh:
+			return false
+		}
+	}
 	if !c.eng.inflightSem.acquire(c.eng.finishCh) {
 		return false
 	}
@@ -130,10 +144,13 @@ func (c *keyCoordinator) processOne(item queuedItem) {
 }
 
 // handleOutcome 对一个已弹出堆的事件给出最终结论，并只在此时释放在途槽位。
+// 恢复事件入 mailbox 时未占用槽位，此处对称地不释放。
 func (c *keyCoordinator) handleOutcome(item queuedItem) {
 	outcome, perr := c.eng.processWithRetry(item)
 	c.eng.finalize(item, outcome, perr)
-	c.eng.inflightSem.release()
+	if !item.replay {
+		c.eng.inflightSem.release()
+	}
 }
 
 // advance 从堆顶连续处理序号衔接的事件，直到遇到缺口或堆空。每次成功推进
@@ -166,7 +183,9 @@ func (c *keyCoordinator) advance() {
 			heap.Pop(&c.waitHeap)
 			c.mu.Unlock()
 			c.eng.finalize(top, OutcomeFailed, normalize("engine.order.get", gerr))
-			c.eng.inflightSem.release()
+			if !top.replay {
+				c.eng.inflightSem.release()
+			}
 			close(stopSub)
 			cancel()
 			continue

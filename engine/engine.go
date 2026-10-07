@@ -144,9 +144,11 @@ func (e *Engine) Start(ctx context.Context) error {
 	return nil
 }
 
-// enqueueReplay 把日志中恢复的事件重新放入内存队列。
+// enqueueReplay 把日志中恢复的事件重新放入内存队列。走恢复专用入口：
+// 不套用运行期的容量背压与优先级限流——这些事件已落盘，恢复必须把它们
+// 全部排空，任何“队列满/高优先级拥塞”的拒绝都会让启动失败并丢失进度。
 func (e *Engine) enqueueReplay(ev Event) *Error {
-	return e.queue.Submit(context.Background(), queuedItem{ev: ev, attempt: 1})
+	return e.queue.submitReplay(queuedItem{ev: ev, attempt: 1})
 }
 
 // submitCtx 返回用于 Submit 等待的上下文：受 SubmitTimeout、外部 ctx 与
